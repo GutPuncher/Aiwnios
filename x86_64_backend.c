@@ -2356,13 +2356,6 @@ static int64_t PopFromStack(CCmpCtrl *cctrl, CICArg *arg, char *bin,
 static int64_t __ICMoveI64(CCmpCtrl *cctrl, int64_t reg, uint64_t imm,
                            char *bin, int64_t code_off) {
   int64_t code;
-  if (bin && !(cctrl->flags & CCF_AOT_COMPILE)) {
-    if (Is32Bit(imm - (int64_t)(bin + code_off))) {
-      AIWNIOS_ADD_CODE(X86LeaSIB, reg, -1, -1, RIP,
-                       imm - (int64_t)(bin + code_off));
-      return code_off;
-    }
-  }
   AIWNIOS_ADD_CODE(X86MovImm, reg, imm);
   return code_off;
 }
@@ -2726,6 +2719,17 @@ static int64_t GetSIBParts(CRPN *r, int64_t *off, CRPN **_b, CRPN **_idx,
     else if (idx = __AddScale(ICArgN(arg, 1), &i2))
       is_sib = 1;
   }
+  //Adjust for offesets in base/index
+  if(b)
+	  while (__AddOffset(b, &tmp)) {
+		  b=__AddOffset(b, &tmp);
+		  i+=tmp;
+	  }
+  if(idx)
+	  while (__AddOffset(idx, &tmp)) {
+		  idx=__AddOffset(idx, &tmp);
+		  i+=tmp*i2;
+	  }
   if (_b)
     *_b = b;
   if (_idx)
@@ -2922,6 +2926,8 @@ static int64_t PushTmpDepthFirst(CCmpCtrl *cctrl, CRPN *r, int64_t spilled) {
       } else if (b) {
         if (b->type != IC_IREG)
           tmp++;
+        else if(b->integer==13) //R13 has quirks when used with SIBs
+		  goto binop;
         if (AIWNIOS_TMP_IREG_CNT - cctrl->backend_user_data2 - 1 < 0)
           goto binop;
         PushTmpDepthFirst(cctrl, b, 0);
@@ -2930,6 +2936,8 @@ static int64_t PushTmpDepthFirst(CCmpCtrl *cctrl, CRPN *r, int64_t spilled) {
       } else if (idx && 0) {
         if (idx->type != IC_IREG)
           tmp++;
+        else if(idx->integer==13) //R13 has quirks when used with SIBs
+		  goto binop;
         if (AIWNIOS_TMP_IREG_CNT - cctrl->backend_user_data2 - 1 < 0)
           goto binop;
         PushTmpDepthFirst(cctrl, idx, 0);
@@ -3042,6 +3050,8 @@ static int64_t PushTmpDepthFirst(CCmpCtrl *cctrl, CRPN *r, int64_t spilled) {
       } else if (b) {
         if (b->type != IC_IREG)
           tmp++;
+        else if(b->integer==13) //R13 has quirks when used with SIBs
+		  goto binop;
         if (tmp && spilled)
           goto deref_norm;
         if (AIWNIOS_TMP_IREG_CNT - cctrl->backend_user_data2 - tmp - 1 < 0 ||
@@ -3053,6 +3063,8 @@ static int64_t PushTmpDepthFirst(CCmpCtrl *cctrl, CRPN *r, int64_t spilled) {
       } else if (idx) {
         if (idx->type != IC_IREG)
           tmp++;
+        else if(idx->integer==13) //R13 has quirks when used with SIBs
+		  goto binop;
         if (tmp && spilled)
           goto deref_norm;
         if (AIWNIOS_TMP_IREG_CNT - cctrl->backend_user_data2 - tmp - 1 < 0 ||
@@ -7531,8 +7543,8 @@ int64_t __OptPassFinal(CCmpCtrl *cctrl, CRPN *rpn, char *bin,
 #define BACKEND_LOGICAL_BINOP(op)                                              \
   next     = ICArgN(rpn, 1);                                                   \
   next2    = ICArgN(rpn, 0);                                                   \
-  code_off = __OptPassFinal(cctrl, next2, bin, code_off);                      \
-  code_off = __OptPassFinal(cctrl, next, bin, code_off);                       \
+  code_off = __OptPassFinal(cctrl, next, bin, code_off);                      \
+  code_off = __OptPassFinal(cctrl, next2, bin, code_off);                       \
   if (rpn->res.mode == MD_REG) {                                               \
     into_reg = rpn->res.reg;                                                   \
   } else                                                                       \

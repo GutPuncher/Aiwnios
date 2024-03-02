@@ -215,6 +215,8 @@ extern U8 * __HC_ICAdd_Gs(U8*)
 #define AIWNIOS_IREG_CNT (28 - 19 + 1)
 #define AIWNIOS_FREG_START 8
 #define AIWNIOS_FREG_CNT (15 - 8 + 1)
+I64 VarIRegToReg(I64 r) {return r+AIWNIOS_IREG_START;}
+I64 VarFRegToReg(I64 r) {return r+AIWNIOS_FREG_START;}
 #endif
 
 #ifdef TARGET_RISCV
@@ -310,6 +312,10 @@ I64 VarIRegToReg(I64 r)  {
 #define AIWNIOS_FREG_CNT (15-6+1)
 #define AIWNIOS_TMP_FREG_START 2
 #define AIWNIOS_TMP_FREG_CNT 14
+I64 VarFRegToReg(I64 r)  {
+  return AIWNIOS_FREG_START+r;
+}
+
 #endif
 //
 // Replaces IC_CALL_INDIRECT(IC_ADDR_IMPORT) with Short jumps if not import
@@ -338,6 +344,10 @@ goto force;
 next:;
   }
 }
+
+
+
+
 I64 IRegIsAvail(CHashFun *fun,I64 r) {
   CMemberLst *mlst=fun->member_lst_and_root;
   while(mlst) {
@@ -358,6 +368,59 @@ I64 FRegIsAvail(CHashFun *fun,I64 r) {
   return TRUE;
 }
 
+class CI64Set {
+  I64 cnt,cap;
+  I64 *body;
+};
+U0 I64SetDel(CI64Set *s) {
+  Free(s->body);
+  Free(s);
+}
+CI64Set *I64SetNew() {
+  CI64Set *s=CAlloc(sizeof(CI64Set));
+  s->cap=16;
+  s->body=CAlloc(16*8);
+  return s;
+}
+Bool I64SetHas(CI64Set *s,I64 v) {
+  I64 i=s->cnt;
+  while(--i>=0)
+    if(s->body[i]==v)
+      return TRUE;
+  return FALSE;
+}
+U0 I64SetAdd(CI64Set *s,I64 v) {
+  if(I64SetHas(s,v)) return;
+  I64 *new;
+  if(s->cnt+1>=s->cap) {
+     new=CAlloc(MSize(s->body)+16*8);
+     s->cap+=16;
+     MemCpy(new,s->body,s->cnt*8);
+     Free(s->body);
+     s->body=new;
+  }
+  s->body[s->cnt++]=v;
+}
+U0 I64SetAddAll(CI64Set *s,CI64Set *from) {
+  I64 idx=from->cnt;
+  while(--idx>=0)
+   I64SetAdd(s,from->body[idx]);
+}
+U0 I64SetRem(CI64Set *s,I64 v) {
+  I64 idx,ptr=0,del=0;
+  for(idx=0;idx!=s->cnt;idx++) {
+    if(s->body[idx]!=v)
+      s->body[ptr++]=s->body[idx];
+    else
+      del++;
+  }
+  s->cnt-=del;
+}
+U0 I64SetRemAll(CI64Set *s,CI64Set *from) {
+  I64 idx=from->cnt;
+  while(--idx>=0)
+   I64SetRem(s,from->body[idx]);
+}
 
 #ifdef TARGET_X86
 I64 VarIRegToReg(I64 r)  {
@@ -368,7 +431,10 @@ I64 VarIRegToReg(I64 r)  {
       break;case 3: return REG_R14;
       break;case 4: return REG_R15;
       break;case 5: return REG_RDI;
+//AIWNIOS_IREG_CNT ends at 6,NOT 7,$BK,1$SEE BELOW NOTE$BK,0$
       break;case 6: return REG_RSI;
+//DO NOT USE THISWITHANYTHING RELATED TO IC_DEREF
+      break;case 7: return REG_R13;
   }
   throw('Compile');
 }
@@ -399,8 +465,10 @@ static Bool IsTLSReloc(CCodeMisc *misc) {
 static Bool IsFunArg(CHashFun *fun,CMemberLst *lst) {
   if(!fun) return FALSE;
   CMemberLst *mlst=fun->member_lst_and_root;
-  I64 idx;
-  for(idx=0;idx!=fun->arg_cnt;idx++) {
+  I64 idx,off=0;
+  if(fun->flags&(1<<Ff_DOT_DOT_DOT))
+    off+=2;
+  for(idx=0;idx!=fun->arg_cnt+off;idx++) {
     if(lst==mlst) return TRUE;
     mlst=mlst->next;
   }
@@ -409,12 +477,617 @@ static Bool IsFunArg(CHashFun *fun,CMemberLst *lst) {
 static I64 FunArgIdx(CHashFun *fun,CMemberLst *lst) {
   if(!fun) return FALSE;
   CMemberLst *mlst=fun->member_lst_and_root;
-  I64 idx;
-  for(idx=0;idx!=fun->arg_cnt;idx++) {
+  I64 idx,off=0;
+  if(fun->flags&(1<<Ff_DOT_DOT_DOT))
+    off+=2;
+  for(idx=0;idx!=fun->arg_cnt+off;idx++) {
     if(lst==mlst) return idx;
     mlst=mlst->next;
   }
   return -1;
+}
+Bool IsKill(I64 t) {
+  switch(t) {
+    case IC_SHL_EQU:
+    case IC_MUL_EQU:
+    case IC_SHR_EQU:
+    case IC_DIV_EQU:
+    case IC_MOD_EQU:
+    case IC_AND_EQU:
+    case IC_OR_EQU:
+    case IC_XOR_EQU:
+    case IC_ADD_EQU:
+    case IC_SUB_EQU:
+    case IC_ASSIGN:
+    case IC__PP:
+    case IC__MM:
+    case IC_PP_:
+    case IC_MM_:
+      return TRUE;
+  }
+  return FALSE;
+}
+CRPN *NthArgument(CRPN *r,I64 a) {
+  r=r->next;
+  while(--a>=0) {
+    r=ICNext(r);
+  }
+  return r;
+}
+I64 FoffToMemberIdx(CCmpCtrl *cc,I64 foff) {
+  CMemberLst *mlst=cc->htc.fun->member_lst_and_root;
+  I64 idx=0;
+  while(mlst) {
+    if(mlst->offset==foff)
+      return idx;
+    mlst=mlst->next;
+    idx++;
+  }
+ 
+ return -1;
+}
+CRPN *LabelToRPN(CCmpCtrl *cc,CCodeMisc *cm) {
+  CRPN *head=&cc->coc.coc_head,*c;
+  for(c=head->next;c!=head;c=c->next) {
+    if(c->type==IC_LABEL&&c->ic_data==cm) {
+       return c;
+    }
+  }
+  return NULL;
+}
+CMemberLst *NthMember(CCmpCtrl *cc,I64 i) {
+  CMemberLst *lst=cc->htc.fun->member_lst_and_root;
+  while(--i>=0) {
+    if(!lst) return NULL;
+    lst=lst->next;
+  }
+  return lst;
+} 
+U0 DumpNthVar(CCmpCtrl *cc,I64 live) {
+  CMemberLst *lst=cc->htc.fun->member_lst_and_root;
+  while(--live>=0) {
+    if(!lst) return;
+    lst=lst->next;
+  }
+  if(!lst) return;
+  DbgPrint("%s,",lst->str);
+}
+U0 DumpLiveSet(CCmpCtrl *cc,CI64Set * set) {
+  I64 bit;
+  for(bit=0;bit!=set->cnt;bit++)
+    DumpNthVar(cc,set->body[bit]);
+}
+//Kind of like SSA
+class CVarRenumber {
+  CI64Set *nodes;
+  I64 idx;
+  I64 new_foffset;
+};
+class CVarRenumbers:CI64Set {
+  I64 foffset;
+};
+class CGraphColoring {
+  I64 *colors;
+};
+class CGraph {
+  CI64Set **connects; //Use Bt
+};
+//This will restore the original IC_FRAME offsets
+U0 VarRenumbersDel(CVarRenumbers *s) { 
+  I64 o_foff=s->foffset;
+  I64 cnt=s->cnt,cnt2;
+  CVarRenumber *rn;
+  CRPN *cur,*next;
+  while(--cnt>=0) {
+    rn=s->body[cnt];
+    cnt2=rn->nodes->cnt;
+    while(--cnt2>=0) {
+      cur=rn->nodes->body[cnt2];
+      next=ICNext(cur);
+      while(next!=cur) {
+	if(cur->type==IC_FRAME&&cur->ic_data==rn->new_foffset)
+	  cur->ic_data=o_foff;
+	cur=cur->next;
+      }
+    }
+    I64SetDel(rn->nodes);
+    Free(rn);
+  }
+  Free(s->body);
+  Free(s);
+}
+Bool InfectAdjacent(CI64Set *add_to,CRPN *a,I64 midx,CI64Set *visited) {
+  CI64Set *set;
+  I64 cnt;
+  if(I64SetHas(visited,a)) return FALSE;
+  if(!I64SetHas(a->live_in,midx)&&!I64SetHas(a->kill_regs,midx))
+    return FALSE;
+  I64SetAdd(visited,a);
+  I64SetAdd(add_to,a);
+  set=a->user_data;
+  for(cnt=0;cnt!=set->cnt;cnt++)
+    InfectAdjacent(add_to,set->body[cnt],midx,visited);
+  set=a->user_data2;
+  for(cnt=0;cnt!=set->cnt;cnt++)
+    InfectAdjacent(add_to,set->body[cnt],midx,visited);
+  return TRUE;
+}
+I64 MakeNumberedMember(CCmpCtrl *cc,I64 from_member,I64 num,I64 tmp_off) {
+  I64 mc;
+  CMemberLst *nth=NthMember(cc,from_member),*new;
+  new=CAlloc(sizeof CMemberLst);
+  new->str=MStrPrint("%s.%d",nth->str,num);
+  new->member_class=nth->member_class;
+  new->reg=REG_ALLOC;
+  new->use_cnt=1; //Avoid "unused" var warnings
+  new->offset=tmp_off;
+  MemberAdd(cc,new,cc->htc.fun,PRS1B_LOCAL_VAR);
+  new=cc->htc.fun->member_lst_and_root;
+  mc=0;
+  while(new) {
+   mc++;
+   new=new->next;
+  }
+  return mc-1;
+}
+U0 DumpLive(CCmpCtrl *cc) {
+  CRPN *cur,*head=&cc->coc.coc_head;
+  CI64Set *set;
+  DbgPrint("Ent:%s\n",cc->htc.fun->str);
+  for(cur=head->next;cur!=head;cur=ICNext(cur)) {
+    DumpRPN(cur);
+    DbgPrint("%s(IN:",intermediate_code_table[cur->type].name);
+    set=cur->live_in;
+    DumpLiveSet(cc,set);
+    DbgPrint(")OUT:");
+    set=cur->live_out;
+    DumpLiveSet(cc,set);
+    DbgPrint("\n");
+  }
+}
+CVarRenumbers *GenerateRenumbersForVar(CCmpCtrl *cc,I64 member,I64 *foff) {
+  I64 new_foff=*foff,cnt=0,idx;
+  CRPN *head=&cc->coc.coc_head,*cur;
+  CMemberLst *mlst=NthMember(cc,member);
+  CVarRenumbers *ret=CAlloc(sizeof CVarRenumbers);
+  CVarRenumber *renum;
+  CI64Set *visited=I64SetNew,*tset;
+  CRPN *cur2,*next2,cnt2;
+  ret->body=CAlloc(16*8);
+  ret->cap=16;
+  ret->foffset=mlst->offset;
+  tset=I64SetNew;
+  for(cur=head->next;cur!=head;cur=ICNext(cur)) {
+    if(InfectAdjacent(tset,cur,member,visited)) {
+      *foff-=8;
+      
+      renum=CAlloc(sizeof CVarRenumber);
+      renum->idx=MakeNumberedMember(cc,member,cnt++,*foff);
+      //DbgPrint("%s,%d,%x,%x\n",mlst->str,renum->idx,*foff,mlst->offset);
+      renum->nodes=I64SetNew;
+      renum->new_foffset=*foff;
+      I64SetAddAll(renum->nodes,tset);
+
+      //Renumber the offsets
+      for(cnt2=tset->cnt-1;cnt2>=0;cnt2--) {
+        cur2=tset->body[cnt2];
+        next2=ICNext(cur2);
+
+	I64SetRem(cur2->live_in,member);
+	I64SetRem(cur2->live_out,member);
+	I64SetRem(cur2->kill_regs,member);
+
+	I64SetAdd(cur2->live_in,renum->idx);
+	I64SetAdd(cur2->live_out,renum->idx);
+	I64SetAdd(cur2->kill_regs,renum->idx);
+
+        while(next2!=cur2) {
+	  if(cur2->type==IC_FRAME&&cur2->ic_data==ret->foffset) {
+	    cur2->ic_data=renum->new_foffset;
+	  }
+	  cur2=cur2->next;
+        }
+      }
+      tset->cnt=0;
+      I64SetAdd(ret,renum);
+    }
+  }
+  I64SetDel(tset);
+  I64SetDel(visited);
+  return ret;
+}
+U0 GraphColoringDel(CGraphColoring *c) {
+  Free(c->colors);
+  Free(c);
+}
+Bool IsPtrVar(CCmpCtrl *cc,I64 foff) {
+  CRPN *rpn,*head=&cc->coc.coc_head,*rpn2;
+  for(rpn=head->next;rpn!=head;) { 
+    if(rpn->type==IC_DEREF) {
+      rpn2=ICNext(rpn);
+      while(rpn!=rpn2) {
+	if(rpn->type==IC_FRAME&&rpn->ic_data==foff) {
+	  return TRUE;
+	}
+	rpn=rpn->next;
+      }
+    } else
+      rpn=rpn->next;
+  }
+  return FALSE;
+}
+CGraphColoring *GraphColor(CCmpCtrl *cc,Bool ireg=TRUE) {
+  CGraph *graph=CAlloc(sizeof CGraph);
+  CGraphColoring *coloring=CAlloc(sizeof CGraphColoring);
+  CRPN *rpn,*head=&cc->coc.coc_head;
+  I64 bit,tmp,bit2,tmp2,mcnt=0,color;
+  I64 reg_cnt,nth_best;
+  CMemberLst *lst=cc->htc.fun->member_lst_and_root,**flat;
+  COptMemberVar *mv; 
+  I64 foff=cc->htc.fun->size;
+  CI64Set *renumbers=I64SetNew;
+  U8 *canidates;
+  while(lst) {
+    mcnt++;
+    lst=lst->next;
+  }
+  mv=CAlloc(sizeof(COptMemberVar)*mcnt);
+  lst=cc->htc.fun->member_lst_and_root;
+  for(tmp=0;tmp!=mcnt;tmp++) {
+    mv[tmp].m=lst;
+    lst=lst->next;
+  }
+  for(rpn=head->next;rpn!=head;rpn=rpn->next) {
+    if(rpn->type==IC_FRAME) {
+      for(tmp=0;tmp!=mcnt;tmp++) {
+        if(mv[tmp].m->offset==rpn->ic_data) {
+	  if(rpn->last(CRPN*)->type==IC_ADDR) {
+	    mv[tmp].addrof_cnt++;
+	    mv[tmp].score=0;
+	    mv[tmp].m->reg=REG_NONE;
+	  }
+	  if(!mv[tmp].addrof_cnt)
+	    mv[tmp].score++;
+        }
+
+      }
+    }
+  }
+  tmp2=mcnt;
+  for(tmp=0;tmp!=mcnt;tmp++) {
+    lst=mv[tmp].m;
+    if(!IsFunArg(cc->htc.fun,lst))
+      if(!mv[tmp].addrof_cnt&&lst->reg==REG_ALLOC||lst->reg==REG_UNDEF) {
+        if(lst->member_class->raw_type==RT_F64&&!ireg) {
+re_number:;
+	  I64SetAdd(renumbers,GenerateRenumbersForVar(cc,tmp,&foff));
+        } else if(lst->member_class->raw_type!=RT_F64&&ireg) {
+	  goto re_number;
+        }
+      }
+  }
+  Free(mv);
+
+  //Recompute with the splits
+  lst=cc->htc.fun->member_lst_and_root;
+  mcnt=0;
+  while(lst) {
+    mcnt++;
+    lst=lst->next;
+  }
+  flat=CAlloc(8*mcnt);
+  mv=CAlloc(sizeof(COptMemberVar)*mcnt);
+  lst=cc->htc.fun->member_lst_and_root;
+  for(tmp=0;tmp!=mcnt;tmp++) {
+    flat[tmp]=lst;
+    mv[tmp].m=lst;
+    lst=lst->next;
+  }
+  coloring->colors=CAlloc(8*mcnt);
+  canidates=MAlloc(mcnt+64);
+  graph->connects=CAlloc(8*mcnt);
+  for(tmp=0;tmp!=mcnt;tmp++) {
+    graph->connects[tmp]=I64SetNew;
+  }
+  for(rpn=head->next;rpn!=head;rpn=rpn->next) {
+    if(rpn->live_in&&rpn->kill_regs) {
+      for(tmp=0;tmp!=rpn->live_in->cnt;tmp++) {
+        bit=rpn->live_in->body[tmp];
+        if(!(flat[bit]->member_class->raw_type==RT_F64^^!ireg)&&flat[bit]->reg!=REG_NONE) {
+	  for(tmp2=0;tmp2!=rpn->live_in->cnt;tmp2++) {
+ 	    bit2=rpn->live_in->body[tmp2];
+	    if(!(flat[bit2]->member_class->raw_type==RT_F64^^!ireg)&&flat[bit2]->reg!=REG_NONE) {
+	      I64SetAdd(graph->connects[bit],bit2);
+	      I64SetAdd(graph->connects[bit2],bit);
+	    }
+	  }
+//Include kill regs
+	  for(tmp2=0;tmp2!=rpn->kill_regs->cnt;tmp2++) {
+	    bit2=rpn->kill_regs->body[tmp2];
+	    if(!(flat[bit2]->member_class->raw_type==RT_F64^^!ireg)&&flat[bit2]->reg!=REG_NONE) {
+	      I64SetAdd(graph->connects[bit],bit2);
+	      I64SetAdd(graph->connects[bit2],bit);
+	    }
+	  }
+        }
+      }
+    }
+  }
+  if(ireg)
+    reg_cnt=AIWNIOS_IREG_CNT;
+  else
+    reg_cnt=AIWNIOS_FREG_CNT;
+//Pre-color varaibles that are defined via "reg" keyword
+  for(tmp=0;tmp!=mcnt;tmp++) {
+    if(0<=mv[tmp].m->reg<REG_REGS_NUM) {
+      coloring->colors[tmp]=mv[tmp].m->reg;
+    }
+  }
+  for(nth_best=mcnt-1;nth_best>=0;nth_best--) {
+    for(tmp=0;tmp!=mcnt;tmp++) {
+      if(mv[nth_best].m==flat[tmp]) {//Unused var?
+        if(!graph->connects[tmp]->cnt) {
+	  coloring->colors[tmp]=-1;
+	  break;
+        }
+        MemSet(canidates,TRUE,mcnt);
+        for(tmp2=0;tmp2!=mcnt;tmp2++) {
+	  if(I64SetHas(graph->connects[tmp],tmp2)) {
+	    if(tmp!=tmp2) {
+	      color=coloring->colors[tmp2];
+	      canidates[color]=FALSE;
+	    }
+	  }
+        }
+        coloring->colors[tmp]=-1;
+        for(color=0;color!=reg_cnt;color++) {
+	  if(canidates[color]) {
+	    coloring->colors[tmp]=color;
+	    break;
+	  }
+        }
+#ifdef TARGET_X86
+//Right here our color points to R13(VarIRegToReg(color)==R13)
+	if(ireg&&canidates[color]) { 
+//Try register R13(has quircks with being used with SIBs)
+//https://wiki.osdev.org/X86-64_Instruction_Encoding
+          if(!IsPtrVar(cc,flat[tmp]->offset)) {
+	    coloring->colors[tmp]=color;
+	    break;
+	  }
+	}
+#endif
+      }
+    }
+  }
+
+  for(tmp=0;tmp!=mcnt;tmp++) {
+    if(!(flat[tmp]->member_class->raw_type==RT_F64^^!ireg))
+      if(flat[tmp]->reg==REG_ALLOC||flat[tmp]->reg==REG_UNDEF) {
+        if(coloring->colors[tmp]==-1)
+	  flat[tmp]->reg=REG_NONE;
+        else if(ireg)
+	  flat[tmp]->reg=VarIRegToReg(coloring->colors[tmp]);
+        else
+	  flat[tmp]->reg=VarFRegToReg(coloring->colors[tmp]);
+      }
+    I64SetDel(graph->connects[tmp]);
+  }
+
+  for(rpn=head->last;rpn!=head;rpn=rpn->last) {
+    if(rpn->type==IC_FRAME) {
+      for(tmp=0;tmp!=mcnt;tmp++) {
+        if(rpn->ic_data==mv[tmp].m->offset) {
+//I hope your arhcitectue of choice has less than REG_NONE registers
+	  if(0<=mv[tmp].m->reg<REG_NONE) { //REG_NONE is 32,other buddies are larger
+	    rpn->type=IC_REG;
+	    rpn->ic_data=mv[tmp].m->reg;
+	  }
+	  break;
+        }
+      }
+    }
+  }
+
+//Keep area for the poo poo tempraries for FunRep
+  cc->htc.fun->size=foff;
+
+  tmp=renumbers->cnt;
+  while(--tmp>=0)
+    VarRenumbersDel(renumbers->body[tmp]);
+  I64SetDel(renumbers);
+  Free(graph->connects);
+  Free(canidates);
+  Free(flat);
+  Free(graph);
+  Free(mv);
+  return coloring;
+}
+U0 _RPNConnect(CRPN *to,CRPN *from) {
+  I64SetAdd(to->user_data,from);
+  I64SetAdd(from->user_data2,to);
+}
+U0 LiveVariableAnalysis(CCmpCtrl *cc) {
+  CRPN *rpn,*head=&cc->coc.coc_head,**flat,*end_rpn,*start_rpn,*arg,*jump_to;
+  CCodeMisc *tab;
+//On first_run I generate the graph connections,no need to recompute each time
+  Bool changed=FALSE,first_run=TRUE;
+  I64 cnt=0,idx,idx2;
+  I64 which;
+  I64 *old_live,old_in,old_out;
+  CI64Set *changed1=I64SetNew,*changed2=I64SetNew;
+  rpn=head->next;
+  while(rpn!=head) {
+    rpn=ICNext(rpn);
+    cnt++;
+  }
+  flat=CAlloc(cnt*8);
+  idx=0;
+  rpn=head->next;
+  while(rpn!=head) {
+//REVERSE polish notation
+    flat[cnt-idx-1]=rpn;
+    idx++;
+    rpn->user_data=I64SetNew;
+    rpn->user_data2=I64SetNew;
+    rpn->live_in=I64SetNew;
+    rpn->live_out=I64SetNew;
+    rpn->kill_regs=I64SetNew;
+    rpn->use_regs=I64SetNew;
+    I64SetAdd(changed1,rpn);
+    rpn=ICNext(rpn);
+  }
+  do {
+    changed=FALSE;
+    for(idx=0;idx!=changed1->cnt;idx++) {
+      start_rpn=changed1->body[idx];
+      end_rpn=ICNext(start_rpn);
+
+      old_in=start_rpn->live_in->cnt;
+      old_out=start_rpn->live_out->cnt;
+
+      if(first_run)
+        for(rpn=start_rpn;rpn!=end_rpn;rpn=rpn->next) {
+	  idx2=intermediate_code_table[rpn->type].arg_cnt;
+	  switch(idx2) {
+	    case IS_V_ARG:
+	      idx2=rpn->length;
+	      break;
+	    case IS_2_ARG:
+	      idx2=2;
+	      break;
+	    case IS_1_ARG:
+	      idx2=1;
+	      break;
+	    case IS_0_ARG:
+	      idx2=0;
+	      break;
+	  }
+	  if(IsKill(rpn->type)) {
+	    arg=NthArgument(rpn,--idx2);
+	    if(arg->type==IC_FRAME) {
+	      which=FoffToMemberIdx(cc,arg->ic_data);
+	      if(rpn->type==IC__MM||rpn->type==IC__PP||
+		    rpn->type==IC_MM_||rpn->type==IC_PP_||
+		    rpn->type==IC_SHL_EQU||
+		    rpn->type==IC_MUL_EQU||
+		    rpn->type==IC_SHR_EQU||
+		    rpn->type==IC_DIV_EQU||
+		    rpn->type==IC_MOD_EQU||
+		    rpn->type==IC_AND_EQU||
+		    rpn->type==IC_OR_EQU||
+		    rpn->type==IC_XOR_EQU||
+		    rpn->type==IC_SUB_EQU||
+		    rpn->type==IC_ADD_EQU)
+	        I64SetAdd(start_rpn->use_regs,which);
+	      I64SetAdd(start_rpn->kill_regs,which);
+	    }
+	  }
+	  while(--idx2>=0) {
+	    arg=NthArgument(rpn,idx2);
+	    if(arg->type==IC_FRAME) {
+	      which=FoffToMemberIdx(cc,arg->ic_data);
+	      I64SetAdd(start_rpn->use_regs,which);
+	    }  
+	  }
+        }
+
+      rpn=start_rpn;
+      switch(rpn->type) {
+        case IC_BR_ZERO ... IC_BR_NOT_BTC:
+	  if(first_run) {
+	    jump_to=LabelToRPN(cc,rpn->ic_data);
+	    _RPNConnect(jump_to,rpn);
+	    I64SetAddAll(rpn->live_out,jump_to->live_in);
+	    goto next_ic;
+	  } else {
+use_outgoing:
+	    for(idx2=0;idx2!=rpn->user_data2(CI64Set*)->cnt;idx2++) {
+	      jump_to=rpn->user_data2(CI64Set*)->body[idx2];
+	      I64SetAddAll(rpn->live_out,jump_to->live_in);
+	    }
+	    break;
+	  }
+        case IC_NOBOUND_SWITCH:
+        case IC_SWITCH:
+	  if(first_run) {
+	    tab=rpn->ic_data;
+	    for(idx2=0;idx2!=tab->range;idx2++) {
+	      if(tab->jmp_table[idx2]) {
+	        jump_to=LabelToRPN(cc,tab->jmp_table[idx2]);
+	        I64SetAddAll(rpn->live_out,jump_to->live_in);
+	        _RPNConnect(jump_to,rpn);
+	      }
+	    }
+	    if(tab->dft) {
+	      jump_to=LabelToRPN(cc,tab->dft);
+	      I64SetAddAll(rpn->live_out,jump_to->live_in);
+	      _RPNConnect(jump_to,rpn);
+	    }
+	  } else
+	    goto use_outgoing;
+	  break;
+        case IC_RET:
+	  break;
+        case IC_JMP:
+	  if(first_run) {
+	    jump_to=LabelToRPN(cc,rpn->ic_data);
+	    I64SetAddAll(rpn->live_out,jump_to->live_in);
+	    _RPNConnect(jump_to,rpn);
+	  } else
+	    goto use_outgoing;
+	  break;
+        case IC_SUB_CALL:
+//Special behavior,we are kind of linking the ends(IC_SUB_CALL/IC_SUB_RET) in a weird way
+//DO NOT first_run CHECK THIS
+	  jump_to=LabelToRPN(cc,rpn->ic_data);
+	  I64SetAddAll(rpn->live_out,jump_to->live_in);
+	  _RPNConnect(jump_to,rpn);
+//Also connect to end of SUB_CALL
+	  for(idx2=0;idx2!=cnt;idx2++) {
+	    if(flat[idx2]->type==IC_SUB_RET&&flat[idx2]->ic_data==rpn->ic_data) {
+	      jump_to=flat[idx2];
+	      _RPNConnect(rpn,jump_to);
+	      I64SetAddAll(jump_to->live_out,rpn->live_in);
+	    }
+	  }
+	  goto next_ic;
+	  break;
+        case IC_SUB_RET:
+	  break;
+        default:
+next_ic:
+	  if(first_run) {
+	    for(idx2=0;idx2!=cnt;idx2++) {
+	      if(flat[idx2]==rpn&&idx2+1<cnt) {
+	        I64SetAddAll(rpn->live_out,flat[idx2+1]->live_in);
+	        _RPNConnect(flat[idx2+1],rpn);
+	        break;
+	      }
+	    }
+	  } else
+	    goto use_outgoing;
+      }
+      rpn->live_in->cnt=0;
+      I64SetAddAll(rpn->live_in,rpn->live_out);
+      I64SetRemAll(rpn->live_in,rpn->kill_regs);
+      I64SetAddAll(rpn->live_in,rpn->use_regs);
+
+      if(old_in!=rpn->live_in->cnt||rpn->live_out->cnt!=old_out) {
+        changed|=TRUE;
+        I64SetAdd(changed2,rpn);
+        for(idx2=0;idx2!=rpn->user_data(CI64Set*)->cnt;idx2++)
+	  I64SetAdd(changed2,rpn->user_data(CI64Set*)->body[idx2]);
+      }
+    }
+    first_run=FALSE;
+    SwapI64(&changed1,&changed2);
+    changed2->cnt=0;
+  } while(changed);
+
+  Free(flat);
+  I64SetDel(changed1);
+  I64SetDel(changed2);
 }
 
 //
@@ -472,93 +1145,21 @@ U8 *AiwniosCompile(CCmpCtrl *cc,I64 *res_sz=NULL,CDbgInfo **info) {
   //  sure arent getting the address of said location
   //
   if(cc->htc.fun) {
+    LiveVariableAnalysis(cc);
+    GraphColoringDel(GraphColor(cc,TRUE));
+    GraphColoringDel(GraphColor(cc,FALSE));
     member_cnt=cc->htc.fun->member_cnt;
     mlst=cc->htc.fun->member_lst_and_root;
     if(cc->htc.fun->flags&(1<<Ff_DOT_DOT_DOT)) {
       member_cnt+=2;
     }
-    mv=CAlloc(member_cnt*sizeof COptMemberVar);
+    mv=CAlloc(member_cnt*sizeof(COptMemberVar));
     foff_lookup=CAlloc(member_cnt*sizeof I64);
     for(idx=0;idx!=member_cnt;idx++) {
       mv[idx].m=mlst;
       mlst=mlst->next;
     }
-    for(cur=head->last;cur!=head;cur=cur->last) {
-      if(cur->type==IC_FRAME) {
-        mlst=cc->htc.fun->member_lst_and_root;
-        for(idx=0;idx!=member_cnt;idx++) {
-          if(cur->ic_data==mv[idx].m->offset) {
-            if(cur->last(CRPN*)->type==IC_ADDR) {
-              mv[idx].addrof_cnt++;
-              mv[idx].score=0;
-            }
-            if(!mv[idx].addrof_cnt)
-              mv[idx].score++;
-            break;
-          }
-          mlst=mlst->next;
-        }
-      }
-    }
-    //Sort by score
-    QSort(mv,member_cnt,sizeof(COptMemberVar),&OptMVCompare);
-    for(idx=0;idx!=member_cnt;idx++) {
-      if(mv[idx].m->reg!=REG_NONE&&mv[idx].score&&!mv[idx].m->dim.next) {
-reg_again:;
-        if(mv[idx].m->member_class->raw_type==RT_F64) {
-          if(AIWNIOS_FREG_START<=fr<AIWNIOS_FREG_START+AIWNIOS_FREG_CNT) {
-            #ifdef TARGET_RISCV
-            if(!FRegIsAvail(cc->htc.fun,VarFRegToReg(fr-AIWNIOS_IREG_START))) {
-	          fr++;
-	          goto reg_again;
-	        }
-            mv[idx].m->reg=VarFRegToReg(fr++ -AIWNIOS_IREG_START);
-            #else
-            mv[idx].m->reg=fr++;
-            #endif
-          } else
-            mv[idx].m->reg=REG_NONE;
-        } else if(mv[idx].m->reg==REG_ALLOC||mv[idx].m->reg==REG_UNDEF) {
-          if(AIWNIOS_IREG_START<=ir<AIWNIOS_IREG_START+AIWNIOS_IREG_CNT) {
-            #ifdef TARGET_RISCV
-            if(!IRegIsAvail(cc->htc.fun,VarIRegToReg(ir-AIWNIOS_IREG_START))) {
-	          ir++;
-	          goto reg_again;
-	        }
-            mv[idx].m->reg=VarIRegToReg(ir++ -AIWNIOS_IREG_START);
-            #else
-            #ifdef TARGET_X86
-	        if(!IRegIsAvail(cc->htc.fun,VarIRegToReg(ir-AIWNIOS_IREG_START))) {
-	          ir++;
-	          goto reg_again;
-	        }
-            mv[idx].m->reg=VarIRegToReg(ir++ -AIWNIOS_IREG_START);
-            #else
-            mv[idx].m->reg=ir++;
-            #endif
-            #endif
-          } else {
-            mv[idx].m->reg=REG_NONE;
-          }
-        }
-      } else
-        mv[idx].m->reg=REG_NONE;
-    }
     
-    //Assign registers
-    for(cur=head->last;cur!=head;cur=cur->last) {
-      if(cur->type==IC_FRAME) {
-        for(idx=0;idx!=member_cnt;idx++) {
-          if(cur->ic_data==mv[idx].m->offset) {          
-            if(mv[idx].m->reg!=REG_NONE) {
-              cur->type=IC_REG;
-              cur->ic_data=mv[idx].m->reg;
-            }
-            break;
-          }
-        }
-      }
-    }
     //In FunRep,the function is assumes to store registers somewhere
     //So i "store" them at the start of the function
     foff=0;
@@ -587,7 +1188,7 @@ reg_again:;
 	  foff_lookup[idx].i32[0]=mlst->offset;
 	  //16 to offset [PC,RBP] pair at base 
 	  mlst->offset=-16-8*FunArgIdx(cc->htc.fun,mlst);
-      foff_lookup[idx].i32[1]=mlst->offset;
+         foff_lookup[idx].i32[1]=mlst->offset;
 	} else {
           foff_lookup[idx].i32[0]=mlst->offset;
           //In X86_64 the stack grows down and the RBP is above the stack pointer,
@@ -1237,6 +1838,12 @@ break;case IC_ASM:
   // For CAiwniosAOTBlob,Fill in the relocations
   //
   for(cur=head->last;cur!=head;cur=cur->last)  {
+    if(cur->live_in) I64SetDel(cur->live_in);
+    if(cur->live_out) I64SetDel(cur->live_out);
+    if(cur->use_regs) I64SetDel(cur->use_regs);
+    if(cur->kill_regs) I64SetDel(cur->kill_regs);
+    if(cur->user_data) I64SetDel(cur->user_data);
+    if(cur->user_data2) I64SetDel(cur->user_data2);
     if(cur->type==IC_ASM) {
 //TODO AOT
       JITFixupAiwniosAOTBlob(cc,cur->ic_data,cur->ic_data(CAiwniosAOTBlob*)->final_start_addr);
@@ -1471,4 +2078,3 @@ U0 DbgInfoRead(U8 *name) {
   }
   Free(body);
 }
-

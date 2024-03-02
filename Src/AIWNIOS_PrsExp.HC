@@ -1,3 +1,4 @@
+extern class CI64Set;
 class CRPN:CQue {
   I64 type,ic_line,ic_flags;
   CHashClass *ic_class;
@@ -16,6 +17,13 @@ class CRPN:CQue {
   union {
     CCodeMisc *misc;
   };
+//For register allocater
+  CI64Set *live_out;
+  CI64Set *live_in;
+  CI64Set *use_regs;
+  CI64Set *kill_regs;
+  U8 *user_data;
+  U8 *user_data2;
 };
 
 Bool IsPtrNode(CRPN *rpn) {
