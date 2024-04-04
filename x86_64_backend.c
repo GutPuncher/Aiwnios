@@ -7570,12 +7570,15 @@ int64_t __OptPassFinal(CCmpCtrl *cctrl, CRPN *rpn, char *bin,
   next2    = ICArgN(rpn, 0);                                                   \
   code_off = __OptPassFinal(cctrl, next, bin, code_off);                       \
   code_off = __OptPassFinal(cctrl, next2, bin, code_off);                      \
+  i =RT_I64i; \
+  if(next->raw_type==RT_F64||next2->raw_type==RT_F64) \
+  i=RT_F64; \
   code_off = PutICArgIntoReg(                                                  \
-      cctrl, &next2->res, rpn->raw_type,                                       \
-      (rpn->raw_type == RT_F64) ? 1 : AIWNIOS_TMP_IREG_POOP2, bin, code_off);  \
+      cctrl, &next2->res, i,                                       \
+      (i == RT_F64) ? 1 : AIWNIOS_TMP_IREG_POOP2, bin, code_off);  \
   code_off =                                                                   \
-      PutICArgIntoReg(cctrl, &next->res, rpn->raw_type, 0, bin, code_off);     \
-  if (rpn->raw_type == RT_F64) {                                               \
+      PutICArgIntoReg(cctrl, &next->res, i, 0, bin, code_off);     \
+  if (i == RT_F64) {                                               \
     AIWNIOS_ADD_CODE(X86COMISDRegReg, next->res.reg, next2->res.reg);          \
   } else {                                                                     \
     AIWNIOS_ADD_CODE(X86CmpRegReg, next->res.reg, next2->res.reg);             \
@@ -7878,12 +7881,8 @@ int64_t __OptPassFinal(CCmpCtrl *cctrl, CRPN *rpn, char *bin,
     code_off = ICMov(cctrl, &tmp, &next->res, bin, code_off);
     // TempleOS will always store F64 result in RAX(integer register)
     // Let's merge the two togheter
-    if (tmp.raw_type == RT_F64) {
+    if (tmp.raw_type == RT_F64)
       AIWNIOS_ADD_CODE(X86MovQI64F64, 0, 0);
-    } else {
-      // Vise versa
-      AIWNIOS_ADD_CODE(X86MovQF64I64, 0, 0);
-    }
     // TODO  jump to return area,not generate epilog for each poo poo
     AIWNIOS_ADD_CODE(X86Jmp, 0);
     CodeMiscAddRef(cctrl->epilog_label, bin + code_off - 4);

@@ -9,7 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 struct arg_lit *arg_help, *arg_overwrite, *arg_new_boot_dir, *arg_asan_enable,
-    *sixty_fps, *arg_cmd_line, *arg_fork;
+    *sixty_fps, *arg_cmd_line, *arg_fork,*arg_no_debug;
 struct arg_file *arg_t_dir, *arg_bootstrap_bin, *arg_boot_files;
 static struct arg_end *_arg_end;
 #ifdef AIWNIOS_TESTS
@@ -492,6 +492,10 @@ static int64_t STK_MemSetU32(int64_t *stk) {
 }
 
 static int64_t STK_MemSetU64(int64_t *stk) {
+  return (int64_t)MemSetU64((void *)stk[0], stk[1], stk[2]);
+}
+
+static int64_t STK_MemSetI64(int64_t *stk) {
   return (int64_t)MemSetU64((void *)stk[0], stk[1], stk[2]);
 }
 
@@ -1208,6 +1212,7 @@ static void BootAiwnios(char *bootstrap_text) {
     PrsAddSymbol("MemSetU16", STK_MemSetU16, 3);
     PrsAddSymbol("MemSetU32", STK_MemSetU32, 3);
     PrsAddSymbol("MemSetU64", STK_MemSetU64, 3);
+    PrsAddSymbol("MemSetI64", STK_MemSetU64, 3);
     PrsAddSymbol("StrLen", STK_strlen, 1);
     PrsAddSymbol("StrCmp", STK_strcmp, 2);
     PrsAddSymbol("ToUpper", STK_toupper, 1);
@@ -1280,7 +1285,10 @@ static void BootAiwnios(char *bootstrap_text) {
     // MUDDY THE STACK WITH ABI "translations"
     PrsAddSymbolNaked("AIWNIOS_SetJmp", AIWNIOS_getcontext, 1);
     PrsAddSymbolNaked("AIWNIOS_LongJmp", AIWNIOS_setcontext, 1);
-    PrsAddSymbolNaked("Call", TempleOS_CallN, 3);
+    PrsAddSymbolNaked("Call", TempleOS_Call, 1);
+    PrsAddSymbolNaked("CallArgs", TempleOS_CallN, 3);
+    PrsAddSymbolNaked("CallVaArgs", TempleOS_CallVaArgs, 5);//fptr,argc1,argv1,argc,argv but argpop so ignored
+							    //(this is for parser.c checks)
     PrsAddSymbol("__HC_ICAdd_ToBool", STK__HC_ICAdd_ToBool, 1);
     PrsAddSymbol("__HC_ICAdd_GetVargsPtr", STK___HC_ICAdd_GetVargsPtr, 1);
     PrsAddSymbol("IsValidPtr", STK_IsValidPtr, 1);
@@ -1483,7 +1491,6 @@ static void ExitAiwnios(int64_t *stk) {
   #undef main
 #endif
 int main(int argc, char **argv) {
-  DebuggerBegin();
   void *argtable[] = {
     arg_help = arg_lit0("h", "help", "Show the help message"),
     arg_overwrite =
@@ -1502,6 +1509,8 @@ int main(int argc, char **argv) {
                                 "boot directory if present)."),
     arg_fork =
         arg_lit0("f", "fork", "Fork to background (for FreeBSD daemons)"),
+    arg_no_debug =
+        arg_lit0("d", "user-debugger", "Faults will be handled by an external debugger(such as gdb)."),
 #endif
     sixty_fps      = arg_lit0("6", "60fps", "Run in 60 fps mode."),
     arg_cmd_line   = arg_lit0("c", NULL, "Run in command line mode."),
@@ -1518,6 +1527,8 @@ int main(int argc, char **argv) {
     arg_print_glossary(stdout, argtable, "  %-25s %s\n");
     exit(1);
   }
+  if(!arg_no_debug->count)
+    DebuggerBegin();
 #ifndef _WIN32
   if (arg_fork->count) {
     pid_t pid = fork();

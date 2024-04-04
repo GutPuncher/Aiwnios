@@ -170,8 +170,6 @@ U0 PrsFun(CCmpCtrl *cc,CHashClass *tmp_return,U8 *name,I64 fsp_flags)
     LexWarn(cc,"Function should return val ");
   RPNAddNew(cc,IC_LABEL,cc->lb_leave,0,FALSE);
   cc->lb_leave=saved_leave_label;
-  RPNAddNew(cc,IC_IMM_I64,0,cc->htc.fun->return_class,FALSE);
-  RPNAddNew(cc,IC_RET,0,cc->htc.fun->return_class,FALSE);
   cc->htc.fun->size&=~7;
   if (cc->flags&CCF_AOT_COMPILE) {
     //ARM likes 4byte align for instrcutions
@@ -1199,18 +1197,18 @@ sm_import:
 		        if (cc->flags&CCF_AOT_COMPILE) {
 			  RPNAddNew(cc,IC_ADDR_IMPORT,
 			        tmp_untry,cmp.internal_types[RT_PTR],FALSE);
-			  RPNAddNew(cc,IC_CALL,
-			        0,cmp.internal_types[RT_PTR],FALSE);
+			  RPNAddNew(cc,IC_CALL_INDIRECT,1,
+			        cmp.internal_types[RT_PTR],FALSE);
 		        } else {
 			  RPNAddNew(cc,IC_IMM_I64,&tmp_untry->exe_addr,,FALSE);
 			  RPNAddNew(cc,IC_DEREF,,FALSE);
-			  RPNAddNew(cc,IC_CALL,
-			        0,cmp.internal_types[RT_PTR],FALSE);
+			  RPNAddNew(cc,IC_CALL_INDIRECT,1,
+			        cmp.internal_types[RT_PTR],FALSE);
 		        }
 		      } else {
 		        RPNAddNew(cc,IC_IMM_I64,tmp_untry->exe_addr,,FALSE);
-		        RPNAddNew(cc,IC_CALL,,
-			      cmp.internal_types[RT_PTR],FALSE);
+		        RPNAddNew(cc,IC_CALL_INDIRECT,
+			      1,cmp.internal_types[RT_PTR],FALSE);
 		      }
 		    }
 		  }
@@ -1218,7 +1216,7 @@ sm_import:
 		    if (!cc->htc.fun->return_class->size)
 		      LexWarn(cc,"Function should NOT return val ");
 		    if (!PrsExpression(cc,NULL,FALSE))
-		      throw('Compiler');
+		      throw('Compiler');
 //Lunk added by nroot,we will convert the result to the return type(F64 or not F64)
 		    if(cc->coc.coc_head.next(CRPN*)->ic_class->raw_type==RT_F64) {
 		      if(cc->htc.fun->return_class->raw_type==RT_F64) {
@@ -1236,11 +1234,13 @@ sm_import:
 		    }
 		    RPNAddNew(cc,IC_RET,,cc->htc.fun->return_class,FALSE);
 		    cc->flags|=CCF_HAS_RETURN;
-		  } else if (cc->htc.fun->return_class->size)
-		    LexWarn(cc,"Function should return val ");
+		  } else {
+		    if (cc->htc.fun->return_class->size)
+		      LexWarn(cc,"Function should return val ");
 //ICAdd(cc,IC_JMP,cc->lb_leave,0); RETURN's  are handled by AIWNIOS as IC_RET,they do housekeeping for you
-		  RPNAddNew(cc,IC_IMM_I64,0,cmp.internal_types[RT_I64],FALSE);
-		  RPNAddNew(cc,IC_RET,,cc->htc.fun->return_class,FALSE);
+		    RPNAddNew(cc,IC_IMM_I64,0,cmp.internal_types[RT_I64],FALSE);
+		    RPNAddNew(cc,IC_RET,,cc->htc.fun->return_class,FALSE);
+		  }
 		  goto sm_semicolon;
 	        case KW_GOTO:
 		  if (Lex(cc)!=TK_IDENT)
