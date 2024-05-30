@@ -22,7 +22,7 @@ U0 LoadOneImport(U8** _src, U8* module_base, I64 ld_flags)
 				if (!(tmpex = HashFind(st_ptr,
 						  Fs->hash_table, HTG_ALL - HTT_IMPORT_SYS_SYM))) {
 					if (!(ld_flags & LDF_SILENT))
-						"Unresolved Reference:%s\n", st_ptr;
+						"Unresolved Reference: %s\n", st_ptr;
 					tmpiss = CAlloc(sizeof(CHashImport));
 					tmpiss->str = StrNew(st_ptr);
 					tmpiss->type = HTT_IMPORT_SYS_SYM;
@@ -42,28 +42,32 @@ U0 LoadOneImport(U8** _src, U8* module_base, I64 ld_flags)
 				i = tmpex->val;
 			switch (etype) {
 			case IET_REL_I8:
-				*ptr2(U8*) = i - ptr2 - 1;
+				i=i - ptr2 - 1;
+				WriteProtectMemCpy(ptr2,&i,1);
 				break;
 			case IET_IMM_U8:
-				*ptr2(U8*) = i;
+				WriteProtectMemCpy(ptr2,&i,1);
 				break;
 			case IET_REL_I16:
-				*ptr2(U16*) = i - ptr2 - 2;
+				i=i - ptr2 - 4;
+				WriteProtectMemCpy(ptr2,&i,2);
 				break;
 			case IET_IMM_U16:
-				*ptr2(U16*) = i;
+				WriteProtectMemCpy(ptr2,&i,2);
 				break;
 			case IET_REL_I32:
-				*ptr2(U32*) = i - ptr2 - 4;
+				i=i - ptr2 - 4;
+				WriteProtectMemCpy(ptr2,&i,4);
 				break;
 			case IET_IMM_U32:
-				*ptr2(U32*) = i;
+				WriteProtectMemCpy(ptr2,&i,4);
 				break;
 			case IET_REL_I64:
-				*ptr2(I64*) = i - ptr2 - 8;
+				i=i - ptr2 - 8;
+				WriteProtectMemCpy(ptr2,&i,8);
 				break;
 			case IET_IMM_I64:
-				*ptr2(I64*) = i;
+			    WriteProtectMemCpy(ptr2,&i,8);
 				break;
 			}
 		}

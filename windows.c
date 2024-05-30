@@ -1,10 +1,10 @@
 #include "aiwn.h"
 #include "logo.c"
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_pixels.h>
-#include <SDL2/SDL_render.h>
-#include <SDL2/SDL_surface.h>
-#include <SDL2/SDL_video.h>
+#include <SDL.h>
+#include <SDL_pixels.h>
+#include <SDL_render.h>
+#include <SDL_surface.h>
+#include <SDL_video.h>
 static SDL_Palette *sdl_p;
 static SDL_Surface *screen;
 static SDL_Surface *window_icon;
@@ -35,6 +35,8 @@ static void _DrawWindowNew() {
                           SDL_HINT_OVERRIDE);
   SDL_SetHintWithPriority(SDL_HINT_RENDER_SCALE_QUALITY, "linear",
                           SDL_HINT_OVERRIDE);
+  SDL_SetHintWithPriority(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "1",
+                          SDL_HINT_OVERRIDE);
   SDL_RendererInfo info;
   screen_mutex  = SDL_CreateMutex();
   screen_mutex2 = SDL_CreateMutex();
@@ -43,7 +45,8 @@ static void _DrawWindowNew() {
                             SDL_WINDOWPOS_UNDEFINED, 640, 480,
                             SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
   SDL_SetWindowIcon(window, window_icon);
-  SDL_SetWindowKeyboardGrab(window, SDL_TRUE);
+  SDL_SetWindowKeyboardGrab(window,
+                            sdl_window_grab_enable ? SDL_TRUE : SDL_FALSE);
   screen = SDL_CreateRGBSurface(0, 640, 480, 8, 0, 0, 0, 0);
   SDL_SetWindowMinimumSize(window, 640, 480);
   SDL_ShowCursor(SDL_DISABLE);
@@ -490,8 +493,10 @@ static void (*kb_cb)(int64_t, int64_t);
 static void *kb_cb_data;
 static int SDLCALL KBCallback(void *d, SDL_Event *e) {
   int64_t c, s;
-  if (kb_cb && (-1 != __ScanKey(&c, &s, e)))
+  if (kb_cb && (-1 != __ScanKey(&c, &s, e))) {
+    SetWriteNP(1);
     FFI_CALL_TOS_2(kb_cb, c, s);
+  }
   return 0;
 }
 void SetKBCallback(void *fptr) {
@@ -543,6 +548,7 @@ static int SDLCALL MSCallback(void *d, SDL_Event *e) {
         y2 = 479;
       else
         y2 = (y - view_port.y) * 480. / view_port.h;
+      SetWriteNP(1);
       FFI_CALL_TOS_4(ms_cb, x2, y2, z, state);
     }
   return 0;

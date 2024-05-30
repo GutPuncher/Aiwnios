@@ -140,7 +140,8 @@ if (NOT SDL2_FOUND)
 endif ()
 target_include_directories(aiwnios PUBLIC ${SDL2_INCLUDE_DIRS})
 if (ARCH STREQUAL arm64)
-  target_link_libraries(aiwnios PRIVATE ${SDL2_LIBRARIES})
+    target_link_directories(aiwnios PUBLIC /usr/local/lib)
+    target_link_libraries(aiwnios PRIVATE SDL2)
 elseif (ARCH STREQUAL x86_64)
   if(NOT WIN32)
     target_link_libraries(aiwnios PRIVATE SDL2::SDL2)
@@ -150,19 +151,28 @@ elseif (ARCH STREQUAL x86_64)
   endif()
 endif ()
 
-#
-# Nroot here,FreeBSD depreaceated procfs so I need to use libprocstat
-#  Im looking at here,feel free to rewrite
-#
-#https://cmake.org/pipermail/cmake/2008-April/021282.html
-#
-if(UNIX)
-    EXEC_PROGRAM(uname OUTPUT_VARIABLE SYSTEM_NAME)
-    SET(SYSTEM_NAME "${SYSTEM_NAME}" CACHE INTERNAL "")
-    if(SYSTEM_NAME STREQUAL "FreeBSD")
-      target_link_libraries(aiwnios PRIVATE procstat)
-    endif()
-endif()
+if (CMAKE_BUILD_TYPE STREQUAL "MinSizeRel"
+    OR CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+  if (CMAKE_C_COMPILER_ID MATCHES "Clang")
+    find_program(LLD lld)
+    if (NOT LLD)
+      message(FATAL_ERROR "LTO with Clang requires LLD")
+    endif ()
+    set_target_properties(aiwnios
+      PROPERTIES
+      INTERPROCEDURAL_OPTIMIZATION OFF)
+    target_link_options(aiwnios PRIVATE -flto=full -fuse-ld=lld)
+    target_compile_options(aiwnios PRIVATE -flto=full)
+  else ()
+    set_target_properties(aiwnios
+      PROPERTIES
+      INTERPROCEDURAL_OPTIMIZATION ON)
+  endif ()
+endif ()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+  target_link_libraries(aiwnios PRIVATE procstat)
+endif ()
 target_compile_options(aiwnios PRIVATE -w)
 
 add_library(FFI STATIC ${ASM_SOURCES})
@@ -183,6 +193,7 @@ endif()
 set(COMP_OPTS
   -Wno-all
   -Wno-incompatible-function-pointer-types
+  -Wno-incompatible-pointer-types
   -fno-math-errno
   -fno-trapping-math
   -fno-exceptions
@@ -245,6 +256,13 @@ if (BUILD_HCRT)
   )
 endif ()
 
+#
+# Gay section
+#
+set_target_properties(aiwnios PROPERTIES
+  MACOSX_BUNDLE TRUE
+  MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist
+)
 
 #
 # Install section

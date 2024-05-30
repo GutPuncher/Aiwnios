@@ -1383,7 +1383,15 @@ void OptPassRegAlloc(CCmpCtrl *cctrl) {
   }
   // Time to assign the rest of the function members to the base pointer
   qsort(mv, cnt, sizeof(COptMemberVar), (void *)&OptMemberVarSortSz);
+  #if defined(__riscv__) || defined(__riscv)
+  //In RiscV
+  // s0    -> TOP
+  // s0-8  -> return_address
+  // s0-16 -> old s0
+  off=16;
+  #else
   off = 0;
+  #endif
   for (i = 0; i != cnt; i++) {
     if (mv[i].m->reg == REG_NONE && !(mv[i].m->flags & MLF_STATIC)) {
       switch (mv[i].m->member_class->raw_type) {
@@ -1585,7 +1593,7 @@ static void OptPassMergeAddressOffsets(CCmpCtrl *cctrl) {
           break;
         case IC_BASE_PTR:
 // Stack grows down
-#if defined(__x86_64__) || defined (__riscv) || defined(__riscv__)
+#if defined(__x86_64__) || defined(__riscv) || defined(__riscv__)
           base->integer -= off->integer;
 #else
           base->integer += off->integer;
@@ -1618,7 +1626,8 @@ static void OptPassMergeAddressOffsets(CCmpCtrl *cctrl) {
   }
 }
 
-char *Compile(CCmpCtrl *cctrl, int64_t *res_sz, char **dbg_info,CHeapCtrl *heap) {
+char *Compile(CCmpCtrl *cctrl, int64_t *res_sz, char **dbg_info,
+              CHeapCtrl *heap) {
   CRPN *r;
   int64_t old_flags = cctrl->flags;
   for (r = cctrl->code_ctrl->ir_code->next; r != cctrl->code_ctrl->ir_code;
@@ -1635,5 +1644,5 @@ char *Compile(CCmpCtrl *cctrl, int64_t *res_sz, char **dbg_info,CHeapCtrl *heap)
   OptPassRemoveUselessTypecasts(cctrl);
   OptPassMergeAddressOffsets(cctrl);
   cctrl->flags = old_flags;
-  return OptPassFinal(cctrl, res_sz, dbg_info,heap);
+  return OptPassFinal(cctrl, res_sz, dbg_info, heap);
 }

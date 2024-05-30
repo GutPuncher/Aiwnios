@@ -3,7 +3,7 @@
   #define _WIN32 1
   #define WIN32
 #endif
-#include <SDL2/SDL.h>
+#include <SDL.h>
 #include <assert.h>
 #include <signal.h>
 #include <stddef.h>
@@ -23,6 +23,10 @@ struct CHash;
 struct CHashTable;
 struct CHashFun;
 struct CTask;
+
+// See -g or --grab-focus
+extern int64_t sdl_window_grab_enable;
+
 void *__AIWNIOS_CAlloc(int64_t cnt, void *t);
 void *__AIWNIOS_MAlloc(int64_t cnt, void *t);
 void __AIWNIOS_Free(void *ptr);
@@ -136,24 +140,28 @@ typedef struct CTask {
   void *stack;
   char ctx[2048];
   jmp_buf throw_pad;
-  struct CHeapCtrl *heap;
+  struct CHeapCtrl *heap,*code_heap;
 } CTask;
 typedef struct CHeapCtrl {
   int32_t hc_signature;
-  char is_code_heap;
+  int32_t is_code_heap;
   int64_t locked_flags, alloced_u8s, used_u8s;
   struct CTask *mem_task;
   struct CMemUnused *malloc_free_lst, *heap_hash[MEM_HEAP_HASH_SIZE / 8 + 1];
   CQue mem_blks;
+  CQue used_mem;
 } CHeapCtrl;
 typedef struct CMemBlk {
   CQue base;
+  CQue base2;
   int64_t pags;
 } CMemBlk;
 typedef struct __attribute__((packed)) CMemUnused {
   // MUST BE FIRST MEMBER
   struct CMemUnused *next;
+  struct CMemUnused *last; //Used for used memory only
   CHeapCtrl *hc;
+  void *caller1,*caller2; //Used for used memory only
   int64_t sz; // MUST BE LAST MEMBER FOR MAllocAligned
 } CMemUnused;
 typedef struct CHash {
@@ -368,6 +376,7 @@ typedef struct CCodeCtrl {
 } CCodeCtrl;
 typedef struct CCodeMiscRef {
   struct CCodeMiscRef *next;
+  CRPN *from_ic;
   int32_t *add_to, offset;
   // For arm
   int32_t (*patch_cond_br)(int64_t, int64_t);
@@ -375,9 +384,10 @@ typedef struct CCodeMiscRef {
   int64_t user_data1;
   int64_t user_data2;
   int8_t is_abs64;
-  //Used for RISC-V
-  int8_t is_jal; //Not JALR
-  int8_t is_4_bytes; //Default is 8 bytes
+  // Used for RISC-V
+  int8_t is_jal;     // Not JALR
+  int8_t is_4_bytes; // Default is 8 bytes
+  int8_t is_dummy;
 } CCodeMiscRef;
 typedef struct CCodeMisc {
   CQue base;
@@ -410,7 +420,7 @@ typedef struct CCodeMisc {
   };
   int32_t aot_before_hint; // See __HC_SetAOTRelocBeforeRIP
   int32_t use_cnt;
-  int32_t code_off; //Used for riscv_backend.c for choosing big/small jumps
+  int32_t code_off; // Used for riscv_backend.c for choosing big/small jumps
   // The bit is set if the floating point register is alive at this inst
   int64_t freg_alive_bmp;
   CCodeMiscRef *refs;
@@ -438,11 +448,16 @@ typedef struct CCmpCtrl {
   int64_t backend_user_data8;
   int64_t backend_user_data9;
   int64_t backend_user_data10;
+  int64_t backend_user_data11;
+  int64_t used_iregs_bmp;
+  int64_t used_fregs_bmp;
+  int found_used_iregs;
+  int found_used_fregs;
   // Used for returns
   CCodeMisc *epilog_label, *statics_label;
   // In SysV,the fregs are not saved,so i will make a mini function to save them
   CCodeMisc *fregs_save_label, *fregs_restore_label;
-  CHeapCtrl *hc;
+  CHeapCtrl *hc, *final_hc;
   int64_t is_lock_expr; // lock EXPRESSION;
   // private for AARCH64 for use with IC_LOCK
   // I will use the ldxsr/stxr instructions in a loop
@@ -634,7 +649,8 @@ enum {
   ICF_STUFF_IN_REG = 64, // Will stuff the result into a register(.stuff_in_reg)
                          // once result is computed
   ICF_LOCK_EXPR = 128,   // Used with lock {}
-  ICF_IS_BOOL =256
+  ICF_IS_BOOL   = 256,
+  ICF_NO_JUMP=512, //Used for eliminating jumps to next instruction
 };
 struct CRPN {
   CQue base;
@@ -656,10 +672,13 @@ struct CRPN {
   CCodeMisc *code_misc2, *code_misc3, *code_misc4;
   CICArg res;
   CRPN *tree1, *tree2, *ic_fwd;
+  //Use with Misc_Bt,includes temporaries
+  int64_t changes_iregs,changes_fregs;
   // Will be stored into this reg if ICF_STUFF_IN_REG is set
   char stuff_in_reg;
 };
-extern char *Compile(struct CCmpCtrl *cctrl, int64_t *sz, char **dbg_info,CHeapCtrl*);
+extern char *Compile(struct CCmpCtrl *cctrl, int64_t *sz, char **dbg_info,
+                     CHeapCtrl *);
 extern _Thread_local struct CTask *Fs;
 void AIWNIOS_throw(uint64_t code);
 #define throw AIWNIOS_throw
@@ -746,7 +765,8 @@ void TaskExit();
 extern _Thread_local struct CTask *HolyFs;
 extern _Thread_local struct CTask *Fs;
 
-char *OptPassFinal(CCmpCtrl *cctrl, int64_t *res_sz, char **dbg_info,CHeapCtrl *heap);
+char *OptPassFinal(CCmpCtrl *cctrl, int64_t *res_sz, char **dbg_info,
+                   CHeapCtrl *heap);
 
 void AIWNIOS_ExitCatch();
 jmp_buf *__throw(uint64_t code);
@@ -822,10 +842,9 @@ enum {
   #define AIWNIOS_TMP_IREG_START 0
   #define AIWNIOS_TMP_IREG_CNT   2
   #define AIWNIOS_FREG_START     6
-  #define AIWNIOS_FREG_CNT       (15 - 6 + 1)
   #define AIWNIOS_TMP_FREG_START 3
   #define AIWNIOS_TMP_FREG_CNT   (5 - 3 + 1)
-
+  #define AIWNIOS_FREG_CNT       (15-6+1)
 #elif (defined(__linux__) || defined(__FreeBSD__)) &&                          \
     (defined(_M_ARM64) || defined(__aarch64__))
   #define AIWNIOS_IREG_START     19
@@ -840,14 +859,27 @@ enum {
   #define AIWNIOS_FREG_CNT       (15 - 8 + 1)
   #define AIWNIOS_TMP_FREG_START 16
   #define AIWNIOS_TMP_FREG_CNT   (31 - 16 + 1)
+#elif defined(__APPLE__) && (defined(_M_ARM64) || defined(__aarch64__))
+  #define AIWNIOS_IREG_START     19
+  #define AIWNIOS_IREG_CNT       (28 - 19 + 1)
+  #define AIWNIOS_REG_FP         ARM_REG_FP
+  #define AIWNIOS_REG_SP         ARM_REG_SP
+  #define AIWNIOS_TMP_IREG_POOP  16
+  #define AIWNIOS_TMP_IREG_POOP2 17 // I use it as a second poo poo ALWAYS
+  #define AIWNIOS_TMP_IREG_START 8
+  #define AIWNIOS_TMP_IREG_CNT   (15 - 8 + 1)
+  #define AIWNIOS_FREG_START     8
+  #define AIWNIOS_FREG_CNT       (15 - 8 + 1)
+  #define AIWNIOS_TMP_FREG_START 16
+  #define AIWNIOS_TMP_FREG_CNT   (31 - 16 + 1)
 #endif
-#if defined (__riscv__) || defined (__riscv)
-#define AIWNIOS_IREG_START 0
-#define AIWNIOS_FREG_START 0
-#define AIWNIOS_TMP_IREG_CNT 5
-#define AIWNIOS_TMP_FREG_CNT 13
-#define AIWNIOS_IREG_CNT (27-18+1+1)
-#define AIWNIOS_FREG_CNT (27-18+1+2)
+#if defined(__riscv__) || defined(__riscv)
+  #define AIWNIOS_IREG_START   0
+  #define AIWNIOS_FREG_START   0
+  #define AIWNIOS_TMP_IREG_CNT 5
+  #define AIWNIOS_TMP_FREG_CNT 13
+  #define AIWNIOS_IREG_CNT     (27 - 18 + 1 + 1)
+  #define AIWNIOS_FREG_CNT     (27 - 18 + 1 + 2)
 #endif
 #if defined(_WIN32) || defined(WIN32)
   #define AIWNIOS_OSTREAM      stdout
@@ -867,6 +899,26 @@ enum {
     AIWNIOS_ExitCatch();                                                       \
   }                                                                            \
   }
+
+#ifndef __APPLE__
+#define SetWriteNP(n) (n)
+#endif
+
+int64_t X86PushReg(char *to, int64_t reg);
+int64_t X86MovRegReg(char *to, int64_t a, int64_t b);
+int64_t X86AndImm(char *to, int64_t a, int64_t b);
+int64_t X86SubImm32(char *to, int64_t a, int64_t b);
+int64_t X86MovImm(char *to, int64_t a, int64_t off);
+int64_t X86LeaSIB(char *to, int64_t a, int64_t s, int64_t i, int64_t b,
+                         int64_t off);
+int64_t X86CallReg(char *to, int64_t reg);
+int64_t X86AddImm32(char *to, int64_t a, int64_t b);
+int64_t X86PopReg(char *to, int64_t reg);
+int64_t X86Ret(char *to, int64_t ul);
+int64_t X86Leave(char *to, int64_t ul);
+int64_t X86JmpReg(char *to, int64_t r);
+
+
 int64_t ARM_ldrsbRegRegX(int64_t r, int64_t a, int64_t b);
 int64_t ARM_ldrshRegRegX(int64_t r, int64_t a, int64_t b);
 int64_t ARM_ldrswRegRegX(int64_t r, int64_t a, int64_t b);
@@ -1028,6 +1080,7 @@ CRPN *__HC_ICAdd_PreDec(CCodeCtrl *cc, int64_t amt);
 CRPN *__HC_ICAdd_PostDec(CCodeCtrl *cc, int64_t amt);
 CRPN *__HC_ICAdd_PostInc(CCodeCtrl *cc, int64_t amt);
 #define HC_IC_BINDINGH(name) CRPN *__##name(CCodeCtrl *cc);
+HC_IC_BINDINGH(HC_ICAdd_GetVaArgsPtr)
 HC_IC_BINDINGH(HC_ICAdd_Pow)
 HC_IC_BINDINGH(HC_ICAdd_Eq)
 HC_IC_BINDINGH(HC_ICAdd_Div)
@@ -1107,7 +1160,8 @@ CCodeMisc *__HC_CodeMiscLabelNew(CCmpCtrl *ccmp, void **);
 CCmpCtrl *__HC_CmpCtrlNew();
 CCodeCtrl *__HC_CodeCtrlPush(CCmpCtrl *ccmp);
 CCodeCtrl *__HC_CodeCtrlPop(CCmpCtrl *ccmp);
-char *__HC_Compile(CCmpCtrl *ccmp, int64_t *sz, char **dbg_info,CHeapCtrl *heap);
+char *__HC_Compile(CCmpCtrl *ccmp, int64_t *sz, char **dbg_info,
+                   CHeapCtrl *heap);
 CRPN *__HC_ICAdd_Goto(CCodeCtrl *cc, CCodeMisc *cm);
 CRPN *__HC_ICAdd_GotoIf(CCodeCtrl *cc, CCodeMisc *cm);
 CRPN *__HC_ICAdd_Str(CCodeCtrl *cc, CCodeMisc *cm);
@@ -1218,7 +1272,7 @@ const char *ResolveBootDir(char *use, int overwrite, int make_new_dir);
 // Uses TempleOS ABI
 int64_t TempleOS_CallN(void (*fptr)(), int64_t argc, int64_t *argv);
 int64_t TempleOS_Call(void (*fptr)(void));
-int64_t TempleOS_CallVaArgs(void (*fptr)(void),int64_t argc,int64_t *argv);
+int64_t TempleOS_CallVaArgs(void (*fptr)(void), int64_t argc, int64_t *argv);
 CRPN *__HC_ICAdd_RawBytes(CCodeCtrl *cc, char *bytes, int64_t cnt);
 
 extern int64_t bc_enable;
@@ -1291,88 +1345,90 @@ void DebuggerBegin(); // CALL AT THE START OF THE PROGRAM
 void DebuggerClientSetGreg(void *task, int64_t which, int64_t v);
 void DebuggerClientWatchThisTID();
 
-int64_t RISCV_FMV_D_X(int64_t d,int64_t a);
-int64_t RISCV_FMV_X_D(int64_t d,int64_t a);
-int64_t RISCV_FCVT_D_L(int64_t d,int64_t a);
-int64_t RISCV_FCVT_L_D(int64_t d,int64_t a);
-int64_t RISCV_SGNJX(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SGNJN(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SGNJ(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FLE_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FLT_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FEQ_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FMAX_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FMIN_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FSQRT_D(int64_t d,int64_t a);
-int64_t RISCV_FDIV_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FMUL_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FSUB_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FADD_D(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_FSD(int64_t a,int64_t b,int64_t imm);
-int64_t RISCV_FLD(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_REMU(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_REM(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_DIVU(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_DIV(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_MULHU(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_MULHSU(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_MULH(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_MUL(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SRAW(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SRLW(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SLLW(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SUBW(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_ADDW(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SRAIW(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SRLIW(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SLLIW(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_ADDIW(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SRAI(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SRLI(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SLLI(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SD(int64_t s1,int64_t s2,int64_t imm);
-int64_t RISCV_LD(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_LWU(int64_t d,int64_t s,int64_t imm);
+int64_t RISCV_FMV_D_X(int64_t d, int64_t a);
+int64_t RISCV_FMV_X_D(int64_t d, int64_t a);
+int64_t RISCV_FCVT_D_L(int64_t d, int64_t a);
+int64_t RISCV_FCVT_L_D(int64_t d, int64_t a);
+int64_t RISCV_SGNJX(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SGNJN(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SGNJ(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FLE_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FLT_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FEQ_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FMAX_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FMIN_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FSQRT_D(int64_t d, int64_t a);
+int64_t RISCV_FDIV_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FMUL_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FSUB_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FADD_D(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_FSD(int64_t a, int64_t b, int64_t imm);
+int64_t RISCV_FLD(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_REMU(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_REM(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_DIVU(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_DIV(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_MULHU(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_MULHSU(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_MULH(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_MUL(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SRAW(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SRLW(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SLLW(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SUBW(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_ADDW(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SRAIW(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SRLIW(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SLLIW(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_ADDIW(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SRAI(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SRLI(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SLLI(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SD(int64_t s1, int64_t s2, int64_t imm);
+int64_t RISCV_LD(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_LWU(int64_t d, int64_t s, int64_t imm);
 int64_t RISCV_ECALL();
-int64_t RISCV_AND(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_OR(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SRA(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SRL(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_XOR(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SLTU(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SLT(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SLL(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_SUB(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_ADD(int64_t d,int64_t a,int64_t b);
-int64_t RISCV_ANDI(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_ORI(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_XORI(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SLTIU(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SLTI(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_ADDI(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_SW(int64_t s2,int64_t s1,int64_t off);
-int64_t RISCV_SH(int64_t s2,int64_t s1,int64_t off);
-int64_t RISCV_SB(int64_t s2,int64_t s1,int64_t off);
-int64_t RISCV_LHU(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_LBU(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_LW(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_LH(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_LB(int64_t d,int64_t s,int64_t imm);
-int64_t RISCV_BGEU(int64_t s2,int64_t s,int64_t off);
-int64_t RISCV_BLTU(int64_t s2,int64_t s,int64_t off);
-int64_t RISCV_BGE(int64_t s2,int64_t s,int64_t off);
-int64_t RISCV_BLT(int64_t s2,int64_t s,int64_t off);
-int64_t RISCV_BNE(int64_t s2,int64_t s,int64_t off);
-int64_t RISCV_BEQ(int64_t s2,int64_t s,int64_t off);
-int64_t RISCV_JALR(int64_t d,int64_t s,int64_t off);
-int64_t RISCV_JAL(int64_t d,int64_t off);
-int64_t RISCV_AUIPC(int64_t d,int64_t off);
-int64_t RISCV_LUI(int64_t d,int64_t off);
-int64_t RISCV_J(int64_t imm_wtf,int64_t d,int64_t opc);
-int64_t RISCV_U(int64_t imm3112,int64_t d,int64_t opc);
-int64_t RISCV_B(int64_t imm,int64_t s1,int64_t s2,int64_t f3,int64_t opc);
-int64_t RISCV_S(int64_t imm115,int64_t s1,int64_t d,int64_t f3,int64_t opc);
-int64_t RISCV_I(int64_t imm,int64_t s1,int64_t f3,int64_t d,int64_t opc);
-int64_t RISCV_R(int64_t f7,int64_t s2,int64_t s1,int64_t f3,int64_t d,int64_t opc);
+int64_t RISCV_AND(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_OR(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SRA(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SRL(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_XOR(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SLTU(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SLT(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SLL(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_SUB(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_ADD(int64_t d, int64_t a, int64_t b);
+int64_t RISCV_ANDI(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_ORI(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_XORI(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SLTIU(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SLTI(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_ADDI(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_SW(int64_t s2, int64_t s1, int64_t off);
+int64_t RISCV_SH(int64_t s2, int64_t s1, int64_t off);
+int64_t RISCV_SB(int64_t s2, int64_t s1, int64_t off);
+int64_t RISCV_LHU(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_LBU(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_LW(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_LH(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_LB(int64_t d, int64_t s, int64_t imm);
+int64_t RISCV_BGEU(int64_t s2, int64_t s, int64_t off);
+int64_t RISCV_BLTU(int64_t s2, int64_t s, int64_t off);
+int64_t RISCV_BGE(int64_t s2, int64_t s, int64_t off);
+int64_t RISCV_BLT(int64_t s2, int64_t s, int64_t off);
+int64_t RISCV_BNE(int64_t s2, int64_t s, int64_t off);
+int64_t RISCV_BEQ(int64_t s2, int64_t s, int64_t off);
+int64_t RISCV_JALR(int64_t d, int64_t s, int64_t off);
+int64_t RISCV_JAL(int64_t d, int64_t off);
+int64_t RISCV_AUIPC(int64_t d, int64_t off);
+int64_t RISCV_LUI(int64_t d, int64_t off);
+int64_t RISCV_J(int64_t imm_wtf, int64_t d, int64_t opc);
+int64_t RISCV_U(int64_t imm3112, int64_t d, int64_t opc);
+int64_t RISCV_B(int64_t imm, int64_t s1, int64_t s2, int64_t f3, int64_t opc);
+int64_t RISCV_S(int64_t imm115, int64_t s1, int64_t d, int64_t f3, int64_t opc);
+int64_t RISCV_I(int64_t imm, int64_t s1, int64_t f3, int64_t d, int64_t opc);
+int64_t RISCV_R(int64_t f7, int64_t s2, int64_t s1, int64_t f3, int64_t d,
+                int64_t opc);
 int64_t ScreenUpdateInProgress();
 
+int64_t DoNothing();

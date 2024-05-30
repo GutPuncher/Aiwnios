@@ -45,6 +45,22 @@ U8 *TaskCaller(CTask *task=NULL,I64 num=0,Bool saved_context=FALSE)
 #endif
 #ifdef TARGET_RISCV
   x29=task->context_save_area[2];
+  if (num) {
+    while (x29) {
+      if(!ChkOnStk(x29,task))
+        break;
+      ptr=x29-1;
+      if(!ptr) break;
+      if (! --num)
+	return *ptr;
+      if (x29>=x29[-2])
+	break;
+      x29=x29[-2];
+    }
+    return NULL;
+  } else {
+  return task->context_save_area[0];
+  }
 #endif
   if (num) {
     while (x29) {
@@ -60,9 +76,6 @@ U8 *TaskCaller(CTask *task=NULL,I64 num=0,Bool saved_context=FALSE)
     }
     return NULL;
   } else {
-#ifdef TARGET_RISCV
-  return task->context_save_area[0];
-#endif
 #ifdef TARGET_X86
     return task->context_save_area[0];
 #else    
@@ -102,6 +115,14 @@ U0 CallerRep(U8 **x29=NULL,CTask *task=NULL)
     else
       x29=task->context_save_area[2];
   }
+  while (ChkOnStk(x29,task)) {
+    ptr=x29-1;
+    "%08X:%08tX:%P\n",ptr,*ptr,*ptr;
+    if (x29>=x29[-2])
+      break;
+    x29=x29[-2];
+  }
+  return;
   #endif
 
   "CallerRep:\n";
@@ -136,18 +157,26 @@ U0 DebuggerSpawn(CTask *debugee) {
 U0 DumbStackTrace(U8 **rbp,U8 *rip) {
   I64 cnt=1;
   DbgPrint("[0]::%P\n",rip);
+#ifdef TARGET_RISCV
+  while(ChkOnStk(rbp,Fs)) {
+    DbgPrint("[%d]::%P\n",cnt++,rbp[-1]);
+    rbp=rbp[-2];
+  }
+
+#else
   while(ChkOnStk(rbp,Fs)) {
     DbgPrint("[%d]::%P\n",cnt++,rbp[1]);
     rbp=*rbp;
   }
+#endif
 }
-
 U0 AiwniosDbgCB(I64 sig,I64 *_gps) {
   I64 gps[33];
   MemCpy(gps,_gps,8*33);
   DebuggerClientStart(Fs,gps);
   CBpt *bp;
   CTask clone;
+  CHashTable *old;
   I64 idx;
   #ifdef TARGET_X86
   I64 oip=gps[0],rbp=gps[2]; 
@@ -158,24 +187,30 @@ U0 AiwniosDbgCB(I64 sig,I64 *_gps) {
   #ifdef TARGET_RISCV
   I64 oip=gps[0],rbp=gps[2]; 
   #endif
-  Fs->is_single_step=FALSE;
-  if(Fs==sys_winmgr_task) {
-    //Oh no,you crashed the window manager
-    DbgPutS("You crashed the window manager,aborting\n");
-    Fs->hash_table=sys_task_being_scrn_updated->hash_table;
-    DumbStackTrace(rbp,oip);
-    ExitAiwnios;
-  }
-  DumbStackTrace(rbp,oip);
-  MemCpy(Fs->context_save_area,gps,22*8);
-  MemCpy(&clone,Fs,sizeof CTask);
-  CTask *task=Spawn(&DebuggerSpawn,&clone,"Debugger",0,Fs);
-  DeathWait(&task);
   #ifdef TARGET_RISCV
   I64 trap=4;
   #else
   I64 trap=5;
   #endif
+  Fs->is_single_step=FALSE;
+  if(Fs==sys_winmgr_task) {
+    //Oh no,you crashed the window manager
+    DbgPutS("You crashed the window manager,Ill try to restart it\n");
+    old=Fs->hash_table;
+    Fs->hash_table=sys_task_being_scrn_updated->hash_table;
+    DumbStackTrace(rbp,oip);
+    Fs->hash_table=old;
+    sys_task_being_scrn_updated->draw_it=NULL;
+    LBts(&sys_task_being_scrn_updated->task_flags,TASKf_KILL_TASK);
+    sys_winmgr_task=Spawn(&WinMgrTask,NULL,"Window Mgr");
+    Exit;
+  }
+  DumbStackTrace(rbp,oip);
+  if(Gs->num) Exit;
+  MemCpy(Fs->context_save_area,gps,22*8);
+  MemCpy(&clone,Fs,sizeof CTask);
+  CTask *task=Spawn(&DebuggerSpawn,&clone,"Debugger",0,Fs);
+  DeathWait(&task);
   if(sig!=trap)
     Exit;
   if(sig==trap) { //SIGTRAP
@@ -502,4 +537,25 @@ U0 Da(U8 **addr,I64 cnt=0x10)
     "%08X:%08X,%P\n",addr,*addr,*addr;
     addr++;
   }
+}
+
+U0 HeapWho() {
+//Dont use current heapctrl for the poo poo suace(we will modify the heap possibly during print)
+  CHeapCtrl *old=Fs->data_heap;
+  CHeapCtrl *dummy=HeapCtrlInit(NULL,Fs,0);
+  CDoc *poop=DocNew; //MAke a dummy document because we are "swapping" CHeapCtrls
+  CMemUsed *used,*head;
+  Fs->data_heap=dummy;
+  head=&old->used_mem;
+  used=head->next;
+  while(LBts(&old->locked_flags,0))
+    Sleep(1);
+  while(used!=head) {
+    DocPrint(poop,"%X(%d) from %P,%P\n",used+1,used->size,used->caller1,used->caller2);
+    used=used->next;
+  }
+  LBtr(&old->locked_flags,0);
+  Fs->data_heap=old;
+  DocInsDoc(DocPut(Fs),poop);
+  HeapCtrlDel(dummy);
 }

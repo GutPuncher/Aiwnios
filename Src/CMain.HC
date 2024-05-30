@@ -69,24 +69,24 @@ U8 *LexStmt2Bin(CCmpCtrl *cc,I64 *_type,I64 cmp_flags=0)
         case IC_CALL_EXTERN:
         case IC_COMMA:
         case IC_TO_BOOL:
-        RPNAddNew(cc,IC_RET,0,AssignRawTypeToNode(rpn),FALSE);
-        break;defualt:
-        RPNAddNew(cc,IC_IMM_I64,0,cmp.internal_types[RT_I64],FALSE);
-        RPNAddNew(cc,IC_RET,0,cmp.internal_types[RT_I64],FALSE);
+	  RPNAddNew(cc,IC_RET,0,AssignRawTypeToNode(rpn),FALSE);
+	  break;defualt:
+	  RPNAddNew(cc,IC_IMM_I64,0,cmp.internal_types[RT_I64],FALSE);
+	  RPNAddNew(cc,IC_RET,0,cmp.internal_types[RT_I64],FALSE);
       }
       if(cc->flags&CCF_AOT_COMPILE)
-        //ARM likes 4byte align for instrcutions
+//ARM likes 4byte align for instrcutions
         while(cc->aotc->rip%4)
-          AOTStoreCodeU8(cc,0);
+	  AOTStoreCodeU8(cc,0);
       if (res=COCCompile(cc,&size,NULL,_type)) {
-	if (cc->flags&CCF_AOT_COMPILE) {
+        if (cc->flags&CCF_AOT_COMPILE) {
 	  j=cc->aotc->rip;
 	  k=(size+7)>>3;
-    for (i=0;i<k;i++)
+	  for (i=0;i<k;i++)
 	    AOTStoreCodeU64(cc,res[i]);
 	  Free(res);
 	  res=j;
-	}
+        }
       }
     } //TODO: else del misc?
   } else //TODO: too dangerous to del Misc?
@@ -242,7 +242,7 @@ CAOT *CmpBuf(U8 *buf,U8 *map_name=NULL,
 I64 Cmp(U8 *filename,U8 *map_name=NULL,U8 *out_name=NULL,U8 mapfile_drv_let=0)
 {//AOT Compile HC or PRJ file a and output BIN file. Returns err_cnt.
   U8 *ptr,*fbuf=NULL,*fbuf2=NULL,*fbuf3=NULL,
-	*patch_table=MAlloc(0x60000);
+	*patch_table=MAlloc(0x800000);
   CAOT *tmpaot;
   I64 i,cnt,size=0,error_cnt=0,warning_cnt=0,aot_U8s=0;
   CBinFile *bfh;
@@ -300,10 +300,16 @@ I64 Cmp(U8 *filename,U8 *map_name=NULL,U8 *out_name=NULL,U8 mapfile_drv_let=0)
 	} else
 	  *ptr++=0;
 	*ptr(I64 *)++=tmphg->size;
+	if(!tmphg->data)
+	  tmphg->data=CAlloc(tmphg->size);
+	MemCpy(ptr,tmphg->data,tmphg->size);
+	ptr+=tmphg->size;
+	Free(tmphg->data);
 	tmphgr=tmphg->references;
 	while (tmphgr) {
 	  tmphgr1=tmphgr->next;
 	  *ptr(U32 *)++=tmphgr->rip;
+	  *ptr(U32 *)++=tmphgr->offset; //Added by nroot
 	  Free(tmphgr);
 	  tmphgr=tmphgr1;
 	}
@@ -342,6 +348,10 @@ I64 Cmp(U8 *filename,U8 *map_name=NULL,U8 *out_name=NULL,U8 mapfile_drv_let=0)
       if (tmpie->aot)
 	tmpie->rip+=tmpie->aot->rip2;
       *ptr(U32 *)++=tmpie->rip;
+      switch(tmpie->type) {
+      case IET_REL_I0 ... IET_REL_RISCV:
+		*ptr(I32 *)++=tmpie->offset;
+      }
       if (tmpie->str) {
 	i=StrLen(tmpie->str);
 	MemCpy(ptr,tmpie->str,i+1);
@@ -575,3 +585,4 @@ riscv_patch:
     }
   }
 }
+

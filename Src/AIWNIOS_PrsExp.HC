@@ -588,6 +588,35 @@ mul:
 	  }
         }
 #endif
+#ifdef TARGET_RISCV
+        //I will implement this later for ARM64
+        if(cc->flags&CCF_AOT_COMPILE) {
+	  if(a->type==IC_ADDR_IMPORT&&b->type==IC_IMM_I64) {
+	    width=1;
+	    if(a->ic_dim)
+	      width=a->ic_class->size*a->ic_dim->total_cnt;
+	    else if(IsPtrNode(a))
+	      width=RPNPtrWidth(a);
+	    a->ic_data(CCodeMisc*)->offset+=b->imm_i64*width;
+	    RPNDel(rpn);
+	    RPNDel(b);
+	    PrsPush3(cc->ps,a); //Put back on the stack
+	    return;
+	  }
+	  if(b->type==IC_ADDR_IMPORT&&a->type==IC_IMM_I64) {
+	    width=1;
+	    if(b->ic_dim)
+	      width=b->ic_class->size*b->ic_dim->total_cnt;
+	    else if(IsPtrNode(b))
+	      width=RPNPtrWidth(b);
+	    b->ic_data(CCodeMisc*)->offset+=a->imm_i64*width;
+	    RPNDel(rpn);
+	    RPNDel(a);
+	    PrsPush3(cc->ps,b); //Put back on the stack
+	    return;
+	  }
+        }
+#endif
         if(a->ic_dim) {
 	  width=a->ic_class->size*a->ic_dim->total_cnt;
 	  rpn2=CAlloc(sizeof CRPN);
@@ -697,8 +726,6 @@ pop:
       } else if(rpn->type==IC_DEREF) {
          r2=cc->coc.coc_head.next;
 	if(&cc->coc.coc_head==r2) LexExcept(cc,"Can't get derefernce nothing at ");
-	 if(!r2->ic_dim&&!r2->ic_class->ptr_stars_cnt)
-           LexExcept(cc,"Expected pointer type at ");
       }
       if(rpn)
         RPNAdd(cc,rpn);
@@ -770,7 +797,7 @@ CCodeMisc *CodeMiscHashNew(CCmpCtrl *cc,CHash* h) {
   #ifdef TARGET_X86
   //In X86_64,I will do every relocation as a short one that isnt an import
   if(cc->flags&CCF_AOT_COMPILE) {
-    if(!(h->type&HTF_IMPORT)) {
+    if(!(h->type&HTF_IMPORT)&&!(h->type&HTT_GLBL_VAR)) {
       cur=COCMiscNew(cc,CMT_HASH_ENTRY);
       cur->flags|=CMF_SHORT_ADDR;
       cur->h=h;
@@ -781,7 +808,7 @@ CCodeMisc *CodeMiscHashNew(CCmpCtrl *cc,CHash* h) {
   #ifdef TARGET_RISCV
   //In RISCV do the same
   if(cc->flags&CCF_AOT_COMPILE) {
-    if(!(h->type&HTF_IMPORT)) {
+    if(!(h->type&HTF_IMPORT)&&!(h->type&HTT_GLBL_VAR)) {
       cur=COCMiscNew(cc,CMT_HASH_ENTRY);
       cur->flags|=CMF_SHORT_ADDR;
       cur->h=h;
@@ -790,10 +817,10 @@ CCodeMisc *CodeMiscHashNew(CCmpCtrl *cc,CHash* h) {
   }
   #endif
 
-  for(cur=head->next;cur!=head;cur=cur->next) {
+  /*for(cur=head->next;cur!=head;cur=cur->next) {
     if(cur->h==h)
       return cur;
-  }
+  }*/
   cur=COCMiscNew(cc,CMT_HASH_ENTRY);
   cur->h=h;
   return cur;
@@ -847,6 +874,7 @@ U0 PrsMembers(CCmpCtrl *cc) {
   CHashClass *cls=head->ic_class;
   CArrayDim *ic_dim=head->ic_dim;
   CMemberLst *mlst;
+  CCodeMisc *cm;
   I64 off=0;
   Bool needs_addr=!(cls->ptr_stars_cnt||ic_dim);
   Bool needs_flush=FALSE;
@@ -1493,8 +1521,12 @@ ins_label:
 	  }
 	  if(cc->local_var_entry) {
 	    if(cc->local_var_entry->flags&MLF_STATIC) {
+	      misc=COCMiscNew(cc,CMT_HASH_ENTRY); //->h will be filled in AIWNIOS_CodeGen.HC
+	      misc->offset=cc->local_var_entry;
+	      misc->addr=INVALID_PTR;
+	      misc->flags|=CMF_STATIC;
 	      rpn=RPNAddNew(cc,IC_STATIC,
-		    cc->local_var_entry->static_data,
+		    misc,
 		    cc->local_var_entry->member_class
 		    );
 	    } else {
@@ -1523,8 +1555,9 @@ ins_label:
 		      cc->hash_entry(CHashFun*)->exe_addr,
 		      cc->hash_entry,
 		      );
-	      } else if(cc->flags&CCF_AOT_COMPILE||Bt(&cc->hash_entry(CHashFun*)->flags,Cf_EXTERN)) {
-	        rpn=RPNAddNew(
+	      } else if(Bt(&cc->hash_entry(CHashFun*)->flags,Cf_EXTERN)||cc->flags&CCF_AOT_COMPILE) {
+		if(cc->flags&CCF_AOT_COMPILE) {
+	          rpn=RPNAddNew(
 		      cc,
 		      IC_ADDR_IMPORT,
 		      CodeMiscHashNew(cc,cc->hash_entry),
@@ -1533,6 +1566,20 @@ ins_label:
 		      #ifdef TARGET_RISCV
 		      rpn->ic_data(CCodeMisc*)->flags|=CMF_SHORT_ADDR;
 		      #endif
+		} else {
+		  rpn=RPNAddNew(
+		      cc,
+		      IC_IMM_I64,
+		      &cc->hash_entry(CHashFun*)->exe_addr,
+		      cmp.internal_types[RT_I64]
+		  );
+	          rpn=RPNAddNew(
+		      cc,
+		      IC_DEREF,
+		      0,
+		      cc->hash_entry,
+		      );
+		}
 	      } else
 	        rpn=RPNAddNew(
 		      cc,
@@ -1591,12 +1638,25 @@ ins_label:
 		      cc->hash_entry(CHashGlblVar*)->data_addr,
 		      cmp.internal_types[RT_I64],
 		      );
-	      } else {
+	      } else if(cc->flags&CCF_AOT_COMPILE) {
 	        rpn=RPNAddNew(
 		      cc,
 		      IC_ADDR_IMPORT,
 		      CodeMiscHashNew(cc,cc->hash_entry),
 		      cc->hash_entry(CHashGlblVar*)->var_class,
+		      );
+	      } else {
+		  rpn=RPNAddNew(
+		      cc,
+		      IC_IMM_I64,
+		      &cc->hash_entry(CHashGlblVar*)->data_addr,
+		      cmp.internal_types[RT_I64]
+		  );
+	          rpn=RPNAddNew(
+		      cc,
+		      IC_DEREF,
+		      0,
+		      cmp.internal_types[RT_I64],
 		      );
 	      }
 	      if(cc->hash_entry(CHashGlblVar*)->fun_ptr) {

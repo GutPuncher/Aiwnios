@@ -444,6 +444,26 @@ class CAddShortRelocData {
 	CCodeMisc *cm;
 	U8 *machine_code;
 };
+Bool Globalify(U8 *addr,CAddShortRelocData *data) {
+  CCodeMisc *cm=data->cm;
+  CCmpCtrl *cc=data->cc;
+  if(!(cm->h->type&HTT_GLBL_VAR))
+    return FALSE;
+  CAOTHeapGlbl *glbl_gh=cc->aotc->heap_glbls;
+  CAOTHeapGlblRef *tmpghr;
+  while(glbl_gh&&StrCmp(glbl_gh->str,cm->h->str)) {
+    glbl_gh=glbl_gh->next;
+  }
+  if(glbl_gh) {
+    tmpghr=CAlloc(sizeof CAOTHeapGlblRef);
+    tmpghr->next=glbl_gh->references;
+    glbl_gh->references=tmpghr;
+    tmpghr->offset=cm->offset;
+    tmpghr->rip=cc->aotc->rip+(addr-data->machine_code);
+    return TRUE;
+  }
+  return FALSE;
+}
 U0 AddShortReloc(U8 *addr,CAddShortRelocData *data) {
   CAOTImportExport *tmpaie=CAlloc(sizeof(CAOTImportExport));
   #ifdef TARGET_RISCV
@@ -597,19 +617,32 @@ U0 VarRenumbersDel(CVarRenumbers *s) {
   Free(s);
 }
 Bool InfectAdjacent(CI64Set *add_to,CRPN *a,I64 midx,CI64Set *visited) {
+  CI64Set *stack;
   CI64Set *set;
   I64 cnt;
-  if(I64SetHas(visited,a)) return FALSE;
   if(!I64SetHas(a->live_in,midx)&&!I64SetHas(a->kill_regs,midx))
     return FALSE;
-  I64SetAdd(visited,a);
-  I64SetAdd(add_to,a);
-  set=a->user_data;
-  for(cnt=0;cnt!=set->cnt;cnt++)
-    InfectAdjacent(add_to,set->body[cnt],midx,visited);
-  set=a->user_data2;
-  for(cnt=0;cnt!=set->cnt;cnt++)
-    InfectAdjacent(add_to,set->body[cnt],midx,visited);
+  if(I64SetHas(visited,a)) return FALSE;
+  stack=I64SetNew;
+  I64SetAdd(stack,a);
+  while(stack->cnt) {
+    a=stack->body[--stack->cnt];
+    I64SetAdd(visited,a);
+    if(!I64SetHas(a->live_in,midx)&&!I64SetHas(a->kill_regs,midx)) goto skip;
+    I64SetAdd(add_to,a);  
+    set=a->user_data;
+    for(cnt=0;cnt!=set->cnt;cnt++) {
+      if(!I64SetHas(visited,set->body[cnt]))
+        I64SetAdd(stack,set->body[cnt]);
+    }
+    set=a->user_data2;
+    for(cnt=0;cnt!=set->cnt;cnt++) {
+      if(!I64SetHas(visited,set->body[cnt]))
+        I64SetAdd(stack,set->body[cnt]);
+    }
+skip:;
+  }
+  I64SetDel(stack);
   return TRUE;
 }
 I64 MakeNumberedMember(CCmpCtrl *cc,I64 from_member,I64 num,I64 tmp_off) {
@@ -663,7 +696,6 @@ CVarRenumbers *GenerateRenumbersForVar(CCmpCtrl *cc,I64 member,I64 *foff) {
       
       renum=CAlloc(sizeof CVarRenumber);
       renum->idx=MakeNumberedMember(cc,member,cnt++,*foff);
-      //DbgPrint("%s,%d,%x,%x\n",mlst->str,renum->idx,*foff,mlst->offset);
       renum->nodes=I64SetNew;
       renum->new_foffset=*foff;
       I64SetAddAll(renum->nodes,tset);
@@ -745,8 +777,10 @@ CGraphColoring *GraphColor(CCmpCtrl *cc,Bool ireg=TRUE) {
 	    mv[tmp].addrof_cnt++;
 	    mv[tmp].score=0;
 	    mv[tmp].m->reg=REG_NONE;
-	  }
-	  if(!mv[tmp].addrof_cnt)
+	  } else if(cc->flags&CCF_NO_REG_OPT) {
+	    mv[tmp].score=0;
+	    mv[tmp].m->reg=REG_NONE;
+	  } else if(!mv[tmp].addrof_cnt)
 	    mv[tmp].score++;
         }
 
@@ -997,6 +1031,7 @@ U0 LiveVariableAnalysis(CCmpCtrl *cc) {
         case IC_BR_ZERO ... IC_BR_NOT_BTC:
 	  if(first_run) {
 	    jump_to=LabelToRPN(cc,rpn->ic_data);
+	    if(!jump_to) throw('Compiler');
 	    _RPNConnect(jump_to,rpn);
 	    I64SetAddAll(rpn->live_out,jump_to->live_in);
 	    goto next_ic;
@@ -1015,6 +1050,7 @@ use_outgoing:
 	    for(idx2=0;idx2!=tab->range;idx2++) {
 	      if(tab->jmp_table[idx2]) {
 	        jump_to=LabelToRPN(cc,tab->jmp_table[idx2]);
+	        if(!jump_to) throw('Compiler');
 	        I64SetAddAll(rpn->live_out,jump_to->live_in);
 	        _RPNConnect(jump_to,rpn);
 	      }
@@ -1032,8 +1068,10 @@ use_outgoing:
         case IC_JMP:
 	  if(first_run) {
 	    jump_to=LabelToRPN(cc,rpn->ic_data);
-	    I64SetAddAll(rpn->live_out,jump_to->live_in);
-	    _RPNConnect(jump_to,rpn);
+	    if(jump_to) {
+	      I64SetAddAll(rpn->live_out,jump_to->live_in);
+	      _RPNConnect(jump_to,rpn);
+	    }
 	  } else
 	    goto use_outgoing;
 	  break;
@@ -1041,14 +1079,16 @@ use_outgoing:
 //Special behavior,we are kind of linking the ends(IC_SUB_CALL/IC_SUB_RET) in a weird way
 //DO NOT first_run CHECK THIS
 	  jump_to=LabelToRPN(cc,rpn->ic_data);
-	  I64SetAddAll(rpn->live_out,jump_to->live_in);
-	  _RPNConnect(jump_to,rpn);
+	  if(jump_to) {
+	    I64SetAddAll(rpn->live_out,jump_to->live_in);
+	    _RPNConnect(jump_to,rpn);
 //Also connect to end of SUB_CALL
-	  for(idx2=0;idx2!=cnt;idx2++) {
-	    if(flat[idx2]->type==IC_SUB_RET&&flat[idx2]->ic_data==rpn->ic_data) {
-	      jump_to=flat[idx2];
-	      _RPNConnect(rpn,jump_to);
-	      I64SetAddAll(jump_to->live_out,rpn->live_in);
+	    for(idx2=0;idx2!=cnt;idx2++) {
+	     if(flat[idx2]->type==IC_SUB_RET&&flat[idx2]->ic_data==rpn->ic_data) {
+	        jump_to=flat[idx2];
+	        _RPNConnect(rpn,jump_to);
+	        I64SetAddAll(jump_to->live_out,rpn->live_in);
+	      }
 	    }
 	  }
 	  goto next_ic;
@@ -1101,13 +1141,19 @@ U8 *AiwniosCompile(CCmpCtrl *cc,I64 *res_sz=NULL,CDbgInfo **info) {
   CHashImport *h;
   CAOTImportExport *tmpaie;
   CAOTAbsAddr *tmpabs;
+  CAOTHeapGlbl *tmpgh,*glbl_gh;
+  CAOTHeapGlblRef *tmpghr;
   CAddShortRelocData fill_user_data;
   I64 idx,argc,member_cnt=0,ir=AIWNIOS_IREG_START,fr=AIWNIOS_FREG_START,foff,*foff_lookup=NULL,align;
   I64 reported_min_ln=I16_MAX,reported_max_ln=I16_MIN;
   U8 **aiwnios_dbg_info=NULL;
-  U8 *acc=__HC_CmpCtrlNew(),*machine_code;
+  U8 *acc=__HC_CmpCtrlNew(),*machine_code,*stat_nam,*dumb_crap_apple;
   I64 *table_ptr;
   U8 *cc2=__HC_CodeCtrlPush(acc);
+  U8 *dumb_static;
+  I64 statics_sz=0;
+  static I64 static_cnt=0;
+  stat_nam=MStrPrint(".STATIC_%d",static_cnt++);
   if(GetOption(OPTf_BOUNDS_CHECK)&&HashFind("WhineOOB",cc->htc.glbl_hash_table,HTT_FUN)) {
     for(cur=head->next;cur!=head;cur=cur->next) {
       if(cur->type==IC_DEREF) {
@@ -1162,7 +1208,15 @@ U8 *AiwniosCompile(CCmpCtrl *cc,I64 *res_sz=NULL,CDbgInfo **info) {
     
     //In FunRep,the function is assumes to store registers somewhere
     //So i "store" them at the start of the function
+#ifdef TARGET_RISCV
+    //In RiscV
+    // s0    -> TOP
+    // s0-8  -> return_address
+    // s0-16 -> old s0
+    foff=16;
+#else
     foff=0;
+#endif
     for(idx=0;idx!=member_cnt;idx++) {
       if(mv[idx].m->reg!=REG_NONE) {
         mv[idx].m->offset=foff;
@@ -1187,8 +1241,13 @@ U8 *AiwniosCompile(CCmpCtrl *cc,I64 *res_sz=NULL,CDbgInfo **info) {
 	  //Arguments are passed on stack so no need to mode
 	  foff_lookup[idx].i32[0]=mlst->offset;
 	  //16 to offset [PC,RBP] pair at base 
+	  #ifdef TARGET_RISCV
+//See Above TARGET_RISCV_NOTE
+	  mlst->offset=-8*FunArgIdx(cc->htc.fun,mlst);
+	  #else
 	  mlst->offset=-16-8*FunArgIdx(cc->htc.fun,mlst);
-         foff_lookup[idx].i32[1]=mlst->offset;
+	  #endif
+          foff_lookup[idx].i32[1]=mlst->offset;
 	} else {
           foff_lookup[idx].i32[0]=mlst->offset;
           //In X86_64 the stack grows down and the RBP is above the stack pointer,
@@ -1217,7 +1276,7 @@ U8 *AiwniosCompile(CCmpCtrl *cc,I64 *res_sz=NULL,CDbgInfo **info) {
       foff+=8-(foff&7); //Align to 8    
     cc->htc.fun->size=foff+16;
   }
-  
+
   //Replace the old frame address with the new one 
   for(cur=head->last;cur!=head;cur=cur->last)
     if(cur->type==IC_FRAME)
@@ -1318,13 +1377,12 @@ U8 *AiwniosCompile(CCmpCtrl *cc,I64 *res_sz=NULL,CDbgInfo **info) {
     // foff_lookup will have form [orig_static_data1,offset1,...,orig_static_dataN,offsetN]
     //
     foff=0;
-    foff_lookup=CAlloc(2*member_cnt*8);
     mlst=cc->htc.fun->member_lst_and_root;
     for(idx=0;idx!=member_cnt;idx++) {
       if(mlst->flags&MLF_STATIC) {
-        __HC_ICAdd_StaticData(acc,cc2,foff,mlst->static_data,mlst->member_class->size*mlst->dim.total_cnt);
-        foff_lookup[idx*2]=mlst->static_data;
-        foff_lookup[idx*2+1]=foff;
+//TODO
+//        __HC_ICAdd_StaticData(acc,cc2,foff,mlst->static_data,mlst->member_class->size*mlst->dim.total_cnt);
+		mlst->offset=foff;
         foff+=mlst->member_class->size*mlst->dim.total_cnt;
         if(foff%8)
           foff+=8-foff%8;
@@ -1332,21 +1390,8 @@ U8 *AiwniosCompile(CCmpCtrl *cc,I64 *res_sz=NULL,CDbgInfo **info) {
       mlst=mlst->next;
     }
     if(foff) {
-      for(cur=head->last;cur!=head;cur=cur->last) {
-        if(cur->type==IC_STATIC) {
-          mlst=cc->htc.fun->member_lst_and_root;
-          for(idx=0;idx!=member_cnt;idx++) {
-            if(foff_lookup[idx*2]==cur->ic_data) {
-              cur->ic_data=foff_lookup[idx*2+1];
-              break;
-            }
-            mlst=mlst->next;
-          }
-        }
-      }
-      __HC_ICAdd_SetStaticsSize(cc2,foff);
+      statics_sz=foff;
     }
-    Free(foff_lookup);
   }
   //
   // Step 4,OptClassFwd the ic_class'es to reduce to I64 to I64i's etc
@@ -1520,7 +1565,7 @@ break;case IC_ASM:
     }
     if(h->type&HTT_GLBL_VAR) {
       if((h(CHashGlblVar*)->flags&GVF_EXTERN)||cc->flags&CCF_AOT_COMPILE) {
-        new=__HC_ICAdd_Reloc(
+        new=__HC_ICAdd_RelocUnique(
           acc,
           cc2,
           &cur->ic_data(CCodeMisc*)->addr,
@@ -1592,7 +1637,9 @@ break;case IC_ASM:
     break;case IC_HOLYC_TYPECAST:
     new=__HC_ICAdd_Typecast(cc2,cur->ic_class->raw_type,0);
     break;case IC_ADDR:
-    new=__HC_ICAdd_Addr(cc2);
+//Change of plans,I am making statics Relocations to be filled on the heap
+    if(cur->next(CRPN*)->type!=IC_STATIC)
+      new=__HC_ICAdd_Addr(cc2);
     break;case IC_COMMA:
     new=__HC_ICAdd_Comma(cc2);
     break;case IC_COM:
@@ -1723,23 +1770,34 @@ break;case IC_ASM:
     */
     break;case IC_VARGS:
     new=__HC_ICAdd_Vargs(cc2,cur->ic_data);
-    break;case IC_STATIC:
+    break;case IC_STATIC:   
     //HolyC side accounts for the ptr arithmetic for us
-    if(cur->last(CRPN*)->type==IC_ADDR) {
-      new=__HC_ICAdd_StaticRef(cc2,cur->ic_data,RT_U8,0);
-    } else if(!cur->ic_dim)
-      new=__HC_ICAdd_StaticRef(cc2,cur->ic_data,cur->ic_class->raw_type,0);
-    else
-      new=__HC_ICAdd_StaticRef(cc2,cur->ic_data,cmp.internal_types[RT_I64],0);
+    new=__HC_ICAdd_Reloc(
+          acc,
+          cc2,
+          &cur->ic_data(CCodeMisc*)->addr,
+          stat_nam,
+          RT_I64,
+          0
+    );
+    if(cur->ic_data(CCodeMisc*)->offset) {
+      misc=cur->ic_data;
+      mlst=misc->offset; //See AIWNIOS_PrsExp.HC
+      __HC_ICAdd_I64(cc2,mlst->offset);
+      __HC_ICAdd_Add(cc2);
     }
-    if(cur->ic_line&&cur->ic_line>=cc->min_line) { //check for oddities(maybe includes accross a file boundary)
+    if(cur->last(CRPN*)->type!=IC_ADDR) {
+      __HC_ICAdd_Deref(cc2,cur->ic_class->raw_type,0);
+    }
+  }
+  if(cur->ic_line&&cur->ic_line>=cc->min_line) { //check for oddities(maybe includes accross a file boundary)
       reported_max_ln=MaxI64(reported_max_ln,cur->ic_line);
       reported_min_ln=MinI64(reported_min_ln,cur->ic_line);
       __HC_ICSetLine(new,cur->ic_line);
     }
     if(cur->ic_flags&ICF_LOCK)
-		__HC_ICSetLock(new);
-  }
+	__HC_ICSetLock(new);
+}
   if(reported_min_ln!=I16_MAX) {
     aiwnios_dbg_info=CAlloc(8*(reported_max_ln-reported_min_ln+2));
   } else 
@@ -1762,8 +1820,50 @@ break;case IC_ASM:
   //
   // Also be sure to turn the relocations to CHashImport's
   //
+  if(statics_sz&&!(cc->flags&CCF_AOT_COMPILE)) {
+     dumb_static=CAlloc(statics_sz);
+     mlst=cc->htc.fun->member_lst_and_root;
+     for(idx=0;idx!=member_cnt;idx++) {
+       if(mlst->flags&MLF_STATIC) {
+	     if(mlst->static_data) {
+		    MemCpy(dumb_static+mlst->offset,mlst->static_data,mlst->member_class->size*mlst->dim.total_cnt);
+	     }
+       }
+       mlst=mlst->next;
+     }
+  }
+  tmpgh=NULL;
   for(misc=cc->coc.coc_next_misc;misc!=&cc->coc.coc_next_misc;misc=misc->next) {
-    if(misc->type==CMT_HASH_ENTRY) {
+    if(misc->flags&CMF_STATIC) {
+      if(misc->addr!=INVALID_PTR) {
+	if(cc->flags&CCF_AOT_COMPILE) {
+          if(!tmpgh) {
+            tmpgh=CAlloc(sizeof CAOTHeapGlbl);
+            tmpgh->size=statics_sz;
+            tmpgh->str=StrNew(stat_nam);
+            tmpgh->next=cc->aotc->heap_glbls;
+            tmpgh->data=CAlloc(statics_sz);
+            cc->aotc->heap_glbls=tmpgh;
+            mlst=cc->htc.fun->member_lst_and_root;
+			for(idx=0;idx!=member_cnt;idx++) {
+			   if(mlst->flags&MLF_STATIC) {
+				 if(mlst->static_data) {
+					MemCpy(tmpgh->data+mlst->offset,mlst->static_data,mlst->member_class->size*mlst->dim.total_cnt);
+				 }
+			   }
+			   mlst=mlst->next;
+			 }
+          }
+          tmpghr=CAlloc(sizeof CAOTHeapGlblRef);
+          tmpghr->next=tmpgh->references;
+          tmpgh->references=tmpghr;
+	      //tmpghr->offset=misc->offset;
+          tmpghr->rip=cc->aotc->rip+(misc->addr(U8*)-machine_code);
+	} else {
+	      WriteProtectMemCpy(misc->addr,&dumb_static,8);
+	}
+      }
+    } else if(misc->type==CMT_HASH_ENTRY) {
       misc->type=CMT_LABEL;
       //
       // AIWNIOS will always use IC_ADDR_IMPORT,but if we find a existing symbol
@@ -1779,21 +1879,28 @@ break;case IC_ASM:
 			fill_user_data.cm=misc;
 			fill_user_data.machine_code=machine_code;
 			__HC_CodeMiscInterateThroughRefs(misc->addr,&AddShortReloc,&fill_user_data);
-          } else if(IsTLSReloc(misc)) {
+          }else if(IsTLSReloc(misc)) {
             tmpaie=CAlloc(sizeof(CAOTImportExport));
             tmpaie->type=IET_IMM_I64;
             tmpaie->str=StrNew(misc->h->str);
             tmpaie->rip=cc->aotc->rip+(misc->addr(U8*)-machine_code);
             tmpaie->offset=misc->offset;
             QueIns(tmpaie,cc->aot->last_ie);
-          } else {
-            tmpaie=CAlloc(sizeof(CAOTImportExport));
+          } else if(misc->h->type&HTT_GLBL_VAR){
+            fill_user_data.cc=cc;
+	    fill_user_data.cm=misc;
+	    fill_user_data.machine_code=machine_code;
+	    if(!Globalify(misc->addr,&fill_user_data))
+		  goto norm_reloc;
+	  } else {
+	  norm_reloc:
+	    tmpaie=CAlloc(sizeof(CAOTImportExport));
             tmpaie->type=IET_IMM_I64;
             tmpaie->str=StrNew(misc->h->str);
             tmpaie->rip=cc->aotc->rip+(misc->addr(U8*)-machine_code);
             tmpaie->offset=misc->offset;
             QueIns(tmpaie,cc->aot->last_ie);
-          }
+	  }
         }
       } else {
         if(misc->addr!=INVALID_PTR) {
@@ -1805,9 +1912,9 @@ break;case IC_ASM:
           //Nroot adds an aditional byte to specify NULL after we load the silly sauce 
           h->module_header_entry=CAlloc(StrLen(h->str)+5+1+1);
           if(IsTLSReloc(misc))
-			h->module_header_entry[0]=IET_IMM_I64;
+	    h->module_header_entry[0]=IET_IMM_I64;
           else 
-			h->module_header_entry[0]=IET_IMM_I64;
+	    h->module_header_entry[0]=IET_IMM_I64;
           h->module_header_entry[1](U32)=misc->addr(U8*)-machine_code;
           StrCpy(h->module_header_entry+5,h->str);
           HashAdd(h,Fs->hash_table);
@@ -1825,13 +1932,16 @@ break;case IC_ASM:
         tmpabs=CAlloc(sizeof(CAOTAbsAddr));
         tmpabs->next=cc->aotc->abss;
         tmpabs->type=AAT_ADD_U64;
-        table_ptr=misc->addr2+8*idx;
-        *table_ptr=cc->aotc->rip+(*table_ptr-machine_code(I64));
+        table_ptr=misc->addr2(U8*)+8*idx;
+        foff=cc->aotc->rip+(*table_ptr-machine_code(I64));
+        WriteProtectMemCpy(table_ptr,&foff,8);
         tmpabs->rip=cc->aotc->rip+((misc->addr2(U8*)+8*idx)-machine_code);
         cc->aotc->abss=tmpabs;	
       }
     }
   }
+  
+  Free(stat_nam);
   __HC_CodeCtrlPop(acc);
   
   //
@@ -1851,6 +1961,7 @@ break;case IC_ASM:
     }
   }
   __HC_CmpCtrlDel(acc);
+  COCDel(cc,&cc->coc);
   return machine_code;
 }
 

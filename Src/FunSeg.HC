@@ -229,14 +229,13 @@ I64 SrcLineNum(U8 *addr,I64 cnt=1)
 	//Reworked by Nrootconauto,his codegen is not so good at genrating good debug info
 	cur_line=best_ln=first_line;
         while(cur_line<=last_line) {
-	  if(body[cur_line]&&addr>=body[cur_line])
-	    if(addr-body[cur_line]<best_dist) 
-	      best_dist=addr-body[cur_line],best_ln=cur_line;
+	  if(body[cur_line])
+	    if(AbsI64(addr-body[cur_line])<best_dist) 
+	      best_dist=AbsI64(addr-body[cur_line]),best_ln=cur_line;
 	  cur_line++;
 	}
 
-	if (addr<body[best_ln]+cnt)
-	  return best_ln+dbg_info->min_line;
+	return best_ln+dbg_info->min_line;
 
       } else if (tmph->src_link) {
 	src =StrNew(tmph->src_link);

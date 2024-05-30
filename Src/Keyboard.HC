@@ -350,6 +350,19 @@ I64 KbdMsEvtTime()
 }
 
 I64 kb_mtx=0;
+U0 InteruptRt(I64 rip,U8 **rbp) {
+  U8 **ptr;
+  DbgPrint("Interupt At:%p",rip,rip);
+  while(ChkOnStk(rbp)) {
+    ptr=rbp+1;
+    DbgPrint(",%p",*ptr);
+    if(rbp>=*rbp)
+      break;
+    rbp=*rbp;
+  }
+  DbgPrint("\n");
+  Yield;
+}
 U0 KBCb(I64 c,I64 s) {
   I64 initial_time,freeze_time=100;
   while(LBts(&kb_mtx,0))
